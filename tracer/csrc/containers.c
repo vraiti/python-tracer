@@ -677,32 +677,41 @@ static PyObject *TracedDeque_iter(PyObject *self) {
     return PyObject_GetIter(((TracedDequeObject *)self)->inner);
 }
 
-static PyObject *TracedDeque_getitem(PyObject *self, PyObject *args) {
+static PyObject *TracedDeque_subscript(PyObject *self, PyObject *key) {
     TracedDequeObject *o = (TracedDequeObject *)self;
-    Py_ssize_t index;
-    if (!PyArg_ParseTuple(args, "n", &index)) return NULL;
-    PyObject *result = PyObject_CallMethod(o->inner, "__getitem__", "n", index);
+    PyObject *result = PyObject_GetItem(o->inner, key);
     if (!result) return NULL;
-    Py_ssize_t len = (Py_ssize_t)o->arw_count;
-    Py_ssize_t idx = index < 0 ? len + index : index;
-    if (idx >= 0 && idx < len)
-        emit_read(&o->arws[idx]);
+    if (PyLong_Check(key)) {
+        Py_ssize_t i = PyLong_AsSsize_t(key);
+        if (!(i == -1 && PyErr_Occurred())) {
+            Py_ssize_t len = (Py_ssize_t)o->arw_count;
+            Py_ssize_t idx = i < 0 ? len + i : i;
+            if (idx >= 0 && idx < len)
+                emit_read(&o->arws[idx]);
+        } else {
+            PyErr_Clear();
+        }
+    }
     return result;
 }
 
-static PyObject *TracedDeque_setitem(PyObject *self, PyObject *args) {
+static int TracedDeque_ass_sub(PyObject *self, PyObject *key, PyObject *value) {
     TracedDequeObject *o = (TracedDequeObject *)self;
-    Py_ssize_t index;
-    PyObject *value;
-    if (!PyArg_ParseTuple(args, "nO", &index, &value)) return NULL;
-    PyObject *r = PyObject_CallMethod(o->inner, "__setitem__", "nO", index, value);
-    if (!r) return NULL;
-    Py_DECREF(r);
-    Py_ssize_t len = (Py_ssize_t)o->arw_count;
-    Py_ssize_t idx = index < 0 ? len + index : index;
-    if (idx >= 0 && idx < len)
-        o->arws[idx] = caller_arw();
-    Py_RETURN_NONE;
+    if (value == NULL)
+        return PyObject_DelItem(o->inner, key);
+    if (PyObject_SetItem(o->inner, key, value) < 0) return -1;
+    if (PyLong_Check(key)) {
+        Py_ssize_t i = PyLong_AsSsize_t(key);
+        if (!(i == -1 && PyErr_Occurred())) {
+            Py_ssize_t len = (Py_ssize_t)o->arw_count;
+            Py_ssize_t idx = i < 0 ? len + i : i;
+            if (idx >= 0 && idx < len)
+                o->arws[idx] = caller_arw();
+        } else {
+            PyErr_Clear();
+        }
+    }
+    return 0;
 }
 
 static PyObject *TracedDeque_append(PyObject *self, PyObject *value) {
@@ -826,8 +835,6 @@ static PyObject *TracedDeque_get_wrapped(PyObject *self, void *closure) {
 }
 
 static PyMethodDef TracedDeque_methods[] = {
-    {"__getitem__", (PyCFunction)TracedDeque_getitem,     METH_VARARGS, NULL},
-    {"__setitem__", (PyCFunction)TracedDeque_setitem,     METH_VARARGS, NULL},
     {"append",      TracedDeque_append,                   METH_O, NULL},
     {"appendleft",  TracedDeque_appendleft,               METH_O, NULL},
     {"extend",      TracedDeque_extend,                   METH_O, NULL},
@@ -855,6 +862,8 @@ static PyType_Slot TracedDeque_slots[] = {
     {Py_tp_methods,  TracedDeque_methods},
     {Py_tp_getset,   TracedDeque_getset},
     {Py_sq_length,   TracedDeque_len},
+    {Py_mp_subscript, TracedDeque_subscript},
+    {Py_mp_ass_subscript, TracedDeque_ass_sub},
     {0, NULL}
 };
 
