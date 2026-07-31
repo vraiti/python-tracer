@@ -28,13 +28,19 @@ $(TRACER_SO): $(TRACER_SRCS) $(TRACER_HDRS)
 		-Itracer/csrc \
 		$(TRACER_SRCS) -o $@
 
+CPYTHON_SRCS := $(shell find $(CPYTHON_DIR) -name '*.c' -o -name '*.h' -o -name '*.py' 2>/dev/null | grep -v __pycache__)
+CPYTHON_STAMP := .cpython-install.stamp
+
 cpython: $(CPYTHON_BIN)
 
 $(CPYTHON_BIN):
 	cd $(CPYTHON_DIR) && CONFIG_SHELL=/bin/sh ./configure --prefix=$(PREFIX) && $(MAKE) -j$(NPROC)
 
-install: cpython ext
-	cd $(CPYTHON_DIR) && $(MAKE) install
+$(CPYTHON_STAMP): $(CPYTHON_SRCS) $(CPYTHON_BIN)
+	cd $(CPYTHON_DIR) && $(MAKE) -j$(NPROC) && $(MAKE) install
+	touch $@
+
+install: $(CPYTHON_STAMP) ext
 	$(PREFIX)/bin/pip install -e .
 
 clean:

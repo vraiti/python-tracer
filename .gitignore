@@ -2,3 +2,4 @@ target
 traces
 **/*.so
 **/__pycache__
+**/.stamp
