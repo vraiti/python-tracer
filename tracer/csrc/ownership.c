@@ -475,23 +475,18 @@ void ownership_patch_class(PyObject *ownership, PyObject *cls) {
         return;
     umap_set(&o->patched_classes, cls_id, 1);
 
-    PyObject *orig_setattr = PyObject_GetAttrString(cls, "__setattr__");
-    if (!orig_setattr) { PyErr_Clear(); return; }
+    PyObject *sa_name = PyUnicode_InternFromString("__setattr__");
+    PyObject *ga_name = PyUnicode_InternFromString("__getattribute__");
 
-    PyObject *orig_getattr = PyObject_GetAttrString(cls, "__getattribute__");
-    if (!orig_getattr) {
-        PyErr_Clear();
-        PyObject *builtins = PyImport_ImportModule("builtins");
-        PyObject *obj_type = builtins ? PyObject_GetAttrString(builtins, "object") : NULL;
-        Py_XDECREF(builtins);
-        orig_getattr = obj_type ? PyObject_GetAttrString(obj_type, "__getattribute__") : NULL;
-        Py_XDECREF(obj_type);
-        if (!orig_getattr) {
-            Py_DECREF(orig_setattr);
-            PyErr_Clear();
-            return;
-        }
-    }
+    PyObject *orig_setattr = _PyType_Lookup((PyTypeObject *)cls, sa_name);
+    Py_DECREF(sa_name);
+    if (!orig_setattr) { Py_DECREF(ga_name); return; }
+    Py_INCREF(orig_setattr);
+
+    PyObject *orig_getattr = _PyType_Lookup((PyTypeObject *)cls, ga_name);
+    Py_DECREF(ga_name);
+    if (!orig_getattr) { Py_DECREF(orig_setattr); return; }
+    Py_INCREF(orig_getattr);
 
     PyObject *traced_set = PyObject_CallFunction(
         (PyObject *)TracedSetattrType, "OOO",
