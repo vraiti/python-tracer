@@ -1,3 +1,4 @@
 [submodule "cpython"]
 	path = cpython
-	url = git@github.com:vraiti/cpython.git
+	url = https://github.com/vraiti/cpython.git
+	branch = 3.12
