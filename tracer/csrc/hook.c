@@ -72,7 +72,6 @@ static void frame_stack_pop(void) {
     if (g_state.frame_count > 0) {
         FrameEntry *e = &g_state.frames[--g_state.frame_count];
         free(e->branch_buf);
-        free(e->cf_bits.words);
     }
 }
 
@@ -101,6 +100,23 @@ static int32_t get_or_assign_function_id(const char *ref_str) {
         return (int32_t)(intptr_t)val;
     int32_t id = g_state.next_func_id++;
     smap_set(&g_state.func_to_id, ref_str, (void *)(intptr_t)id);
+    /* grow cf_bits array to cover the new id */
+    if (id >= g_state.cf_bits_cap) {
+        int32_t new_cap = g_state.cf_bits_cap ? g_state.cf_bits_cap * 2 : 16;
+        while (new_cap <= id) new_cap *= 2;
+        Bitset *tmp = realloc(g_state.cf_bits, new_cap * sizeof(Bitset));
+        if (tmp) {
+            for (int32_t i = g_state.cf_bits_cap; i < new_cap; i++) {
+                tmp[i].words = NULL;
+                tmp[i].max_line = -1;
+                tmp[i].n_words = 0;
+            }
+            g_state.cf_bits = tmp;
+            g_state.cf_bits_cap = new_cap;
+        }
+    }
+    if (id >= g_state.cf_bits_len)
+        g_state.cf_bits_len = id + 1;
     return id;
 }
 
@@ -159,7 +175,7 @@ static void handle_init(PyObject *self_obj, PyCodeObject *code, uint64_t call_id
 /* ---- push a traced frame ---- */
 
 static void push_traced_frame(uint64_t call_id, CallRecordData *record,
-                              const char *ref_str) {
+                              int32_t function_id) {
     FrameEntry entry;
     entry.call_id = call_id;
     entry.record = record;
@@ -168,17 +184,11 @@ static void push_traced_frame(uint64_t call_id, CallRecordData *record,
     entry.branch_len = 0;
     entry.branch_cap = 0;
 
-    void *bits_ptr;
-    if (smap_get(&g_state.cf_bits, ref_str, &bits_ptr)) {
-        Bitset *src = (Bitset *)bits_ptr;
-        entry.cf_bits.max_line = src->max_line;
-        entry.cf_bits.n_words = src->n_words;
-        entry.cf_bits.words = malloc(src->n_words * sizeof(uint64_t));
-        memcpy(entry.cf_bits.words, src->words, src->n_words * sizeof(uint64_t));
+    if (function_id >= 0 && function_id < g_state.cf_bits_len
+            && g_state.cf_bits[function_id].max_line >= 0) {
+        entry.cf_bits = &g_state.cf_bits[function_id];
     } else {
-        entry.cf_bits.words = NULL;
-        entry.cf_bits.max_line = -1;
-        entry.cf_bits.n_words = 0;
+        entry.cf_bits = NULL;
     }
 
     frame_stack_push(&entry);
@@ -290,7 +300,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
                             int32_t obj_id = get_obj_id(self_obj);
                             rec->obj_id = obj_id;
 
-                            push_traced_frame(call_id, rec, ref_buf);
+                            push_traced_frame(call_id, rec, function_id);
                         }
                     }
                 }
@@ -343,7 +353,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
         rec->obj_id = new_obj_id;
     }
 
-    push_traced_frame(call_id, rec, ref_buf);
+    push_traced_frame(call_id, rec, function_id);
 
     ((PyFrameObject *)py_frame)->f_trace_lines = 1;
     Py_DECREF(code);
@@ -365,9 +375,9 @@ static int handle_line(PyObject *py_frame, PyFrameObject *frame_obj) {
         entry->pending_cf = 0;
     }
 
-    if (entry->cf_bits.words &&
-        lineno <= entry->cf_bits.max_line &&
-        bitset_test(&entry->cf_bits, lineno)) {
+    if (entry->cf_bits &&
+        lineno <= entry->cf_bits->max_line &&
+        bitset_test(entry->cf_bits, lineno)) {
         entry->pending_cf = lineno;
     }
 
@@ -536,22 +546,19 @@ static PyObject *py_load_ast_data(PyObject *self, PyObject *args) {
 
     /* clear old data */
     smap_free(&g_state.func_to_id);
-    /* free bitsets in cf_bits before freeing the map */
-    if (g_state.cf_bits.entries) {
-        for (size_t i = 0; i < g_state.cf_bits.capacity; i++) {
-            if (g_state.cf_bits.entries[i].occupied) {
-                Bitset *bs = (Bitset *)g_state.cf_bits.entries[i].value;
-                if (bs) { free(bs->words); free(bs); }
-            }
-        }
+    if (g_state.cf_bits) {
+        for (int32_t i = 0; i < g_state.cf_bits_len; i++)
+            free(g_state.cf_bits[i].words);
+        free(g_state.cf_bits);
+        g_state.cf_bits = NULL;
+        g_state.cf_bits_len = 0;
+        g_state.cf_bits_cap = 0;
     }
-    smap_free(&g_state.cf_bits);
 
     smap_init(&g_state.func_to_id, 512);
-    smap_init(&g_state.cf_bits, 256);
     g_state.next_func_id = 0;
 
-    /* load func_map */
+    /* load func_map — first pass to find max id */
     PyObject *key, *value;
     Py_ssize_t pos = 0;
     while (PyDict_Next(func_map_dict, &pos, &key, &value)) {
@@ -566,17 +573,23 @@ static PyObject *py_load_ast_data(PyObject *self, PyObject *args) {
         }
     }
 
-    /* load cf_lines */
+    /* allocate cf_bits array sized to next_func_id */
+    g_state.cf_bits_cap = g_state.next_func_id > 0 ? g_state.next_func_id : 16;
+    g_state.cf_bits = calloc(g_state.cf_bits_cap, sizeof(Bitset));
+    g_state.cf_bits_len = g_state.next_func_id;
+    for (int32_t i = 0; i < g_state.cf_bits_len; i++)
+        g_state.cf_bits[i].max_line = -1;
+
+    /* load cf_lines — look up function_id for each ref, store by index */
     pos = 0;
     while (PyDict_Next(cf_lines_dict, &pos, &key, &value)) {
         const char *ref_str = PyUnicode_AsUTF8(key);
         if (!ref_str) { PyErr_Clear(); continue; }
-        Bitset bs = bitset_from_pyset(value);
-        if (bs.max_line >= 0) {
-            Bitset *heap_bs = malloc(sizeof(Bitset));
-            *heap_bs = bs;
-            smap_set(&g_state.cf_bits, ref_str, heap_bs);
-        }
+        void *id_ptr;
+        if (!smap_get(&g_state.func_to_id, ref_str, &id_ptr)) continue;
+        int32_t fid = (int32_t)(intptr_t)id_ptr;
+        if (fid < 0 || fid >= g_state.cf_bits_len) continue;
+        g_state.cf_bits[fid] = bitset_from_pyset(value);
     }
 
     Py_RETURN_NONE;

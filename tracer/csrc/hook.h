@@ -18,7 +18,7 @@ typedef struct {
 typedef struct {
     uint64_t call_id;
     CallRecordData *record;
-    Bitset cf_bits;
+    const Bitset *cf_bits;
     int32_t pending_cf;
     uint8_t *branch_buf;
     size_t branch_len;
@@ -45,7 +45,9 @@ typedef struct {
     /* AST data */
     SMap func_to_id;          /* ref_str -> int32_t (cast from void*) */
     int32_t next_func_id;
-    SMap cf_bits;             /* ref_str -> Bitset* (heap-allocated) */
+    Bitset *cf_bits;          /* array indexed by function_id */
+    int32_t cf_bits_len;
+    int32_t cf_bits_cap;
 
     /* Frame stack */
     FrameEntry *frames;
