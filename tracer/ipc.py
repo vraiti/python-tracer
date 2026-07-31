@@ -4,7 +4,7 @@ from typing import Any
 
 import sys
 
-from tracer._tracer import Database, IpcRecord, get_call_id
+from tracer._tracer import Database, get_call_id
 
 
 def _record_ipc(db: Database, self_obj: Any) -> None:
@@ -21,7 +21,7 @@ def _record_ipc(db: Database, self_obj: Any) -> None:
     _TAINT = (1 << 64) - 1
     if caller_id == 0 or caller_id == _TAINT:
         return
-    db.add_ipc(IpcRecord(name=name, obj_idx=caller_id))
+    db.add_ipc(name, caller_id)
 
 
 def patch_message_queue(db: Database) -> None:

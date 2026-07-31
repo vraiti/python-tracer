@@ -17,7 +17,7 @@ typedef struct {
 /* Per-frame entry on the trace stack */
 typedef struct {
     uint64_t call_id;
-    PyObject *record;         /* CallRecordObject* (borrowed from db.calls list) */
+    CallRecordData *record;
     Bitset cf_bits;
     int32_t pending_cf;
     uint8_t *branch_buf;

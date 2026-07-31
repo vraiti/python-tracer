@@ -26,7 +26,7 @@ $(TRACER_SO): $(TRACER_SRCS) $(TRACER_HDRS)
 		-I$(CPYTHON_INTERNAL_INC) \
 		-I$(CPYTHON_ROOT) \
 		-Itracer/csrc \
-		$(TRACER_SRCS) -o $@
+		$(TRACER_SRCS) -lsqlite3 -o $@
 
 CPYTHON_SRCS := $(shell find $(CPYTHON_DIR) -name '*.c' -o -name '*.h' -o -name '*.py' 2>/dev/null | grep -v __pycache__)
 CPYTHON_STAMP := .cpython-install.stamp

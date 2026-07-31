@@ -8,19 +8,15 @@ import threading
 from typing import Any
 
 from tracer._tracer import (
-    CallRecord,
     Database,
-    ObjectRecord,
     OwnershipHook,
     PathFilter,
-    get_call_id,
-    get_func_map,
     install,
     install_thread,
     load_ast_data,
     uninstall,
 )
-from tracer.ast_index import AstIndex
+from tracer.ast_processor import AstProcessor
 from tracer.ipc import patch_message_queue
 from tracer.process_hook import ProcessHook
 
@@ -33,96 +29,6 @@ class TraceHook:
     ) -> None:
         self.db = db
         self.path_filter = path_filter
-
-
-def serialize(db: Database, output: str) -> None:
-    if os.path.exists(output):
-        os.remove(output)
-    conn = sqlite3.connect(output)
-    c = conn.cursor()
-
-    c.executescript("""
-        CREATE TABLE meta (pid INTEGER);
-        CREATE TABLE functions (function_id INTEGER PRIMARY KEY, ref TEXT NOT NULL);
-        CREATE TABLE calls (
-            pid INTEGER NOT NULL,
-            call_id INTEGER NOT NULL,
-            function_id INTEGER NOT NULL,
-            caller_id INTEGER NOT NULL,
-            call_lineno INTEGER NOT NULL,
-            obj_id INTEGER NOT NULL,
-            control_flow BLOB,
-            PRIMARY KEY (pid, call_id)
-        );
-        CREATE TABLE attr_reads (
-            pid INTEGER NOT NULL,
-            call_id INTEGER NOT NULL,
-            caller_id INTEGER NOT NULL,
-            write_call_lineno INTEGER NOT NULL,
-            read_call_lineno INTEGER NOT NULL
-        );
-        CREATE TABLE objects (
-            pid INTEGER NOT NULL,
-            obj_idx INTEGER NOT NULL,
-            call_id INTEGER NOT NULL,
-            PRIMARY KEY (pid, obj_idx)
-        );
-        CREATE TABLE members (
-            pid INTEGER NOT NULL,
-            obj_idx INTEGER NOT NULL,
-            attr TEXT NOT NULL,
-            child_idx INTEGER NOT NULL
-        );
-        CREATE TABLE ipc (
-            pid INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            obj_idx INTEGER NOT NULL
-        );
-    """)
-
-    c.execute("INSERT INTO meta VALUES (?)", (os.getpid(),))
-
-    func_map = {v: k for k, v in get_func_map().items()}
-    c.executemany(
-        "INSERT INTO functions VALUES (?, ?)",
-        func_map.items(),
-    )
-
-    _TAINT_ID = (1 << 64) - 1
-    pid = os.getpid()
-
-    n_calls = 0
-    for rec in db.calls:
-        cf = bytes(rec.control_flow) if rec.control_flow else None
-        caller_id = 0 if rec.caller_id == _TAINT_ID else rec.caller_id
-        c.execute(
-            "INSERT INTO calls VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (pid, rec.call_id, rec.function_id, caller_id, rec.call_lineno, rec.obj_id, cf),
-        )
-        for ar in rec.attr_reads:
-            ar_caller = 0 if ar.caller_id == _TAINT_ID else ar.caller_id
-            c.execute(
-                "INSERT INTO attr_reads VALUES (?, ?, ?, ?, ?)",
-                (pid, rec.call_id, ar_caller, ar.write_call_lineno, ar.read_call_lineno),
-            )
-        n_calls += 1
-
-    n_objects = 0
-    for idx, obj in enumerate(db.objects):
-        c.execute("INSERT INTO objects VALUES (?, ?, ?)", (pid, idx, obj.call_id))
-        for attr, child_idx in dict(obj.members).items():
-            c.execute("INSERT INTO members VALUES (?, ?, ?, ?)", (pid, idx, attr, child_idx))
-        n_objects += 1
-
-    n_ipc = 0
-    for irec in db.ipc:
-        c.execute("INSERT INTO ipc VALUES (?, ?, ?)", (pid, irec.name, irec.obj_idx))
-        n_ipc += 1
-
-    conn.commit()
-    conn.close()
-
-    print(f"Trace written to {output} ({n_calls} calls, {n_objects} objects, {n_ipc} ipc)", file=sys.stderr)
 
 
 def main() -> None:
@@ -146,6 +52,9 @@ def main() -> None:
             cfg = yaml.safe_load(f)
         modules = cfg.get("modules") or []
         tracked_classes = cfg.get("classes") or []
+        for cls_name in tracked_classes:
+            if len(cls_name) >= 512:
+                parser.error(f"tracked class name too long (>= 512 chars): {cls_name[:64]}...")
         taint_patterns = cfg.get("taint-functions") or None
         prefixes = []
         for mod_name in modules:
@@ -162,14 +71,14 @@ def main() -> None:
 
     print("[__main__] Parsing AST")
     path_filter = PathFilter(prefixes=prefixes, tracked_classes=tracked_classes)
-    ast_index = AstIndex()
-    ast_index.preprocess(path_filter)
+    ast_processor = AstProcessor()
+    ast_processor.preprocess(path_filter)
 
     db = Database()
     hook = TraceHook(db, path_filter)
     ownership = OwnershipHook(db, hook)
 
-    load_ast_data(ast_index._func_to_id, ast_index._control_flow_lines)
+    load_ast_data(ast_processor._func_to_id, ast_processor._control_flow_lines)
     
     print("[__main__] Installing hooks")
     patch_message_queue(db)
@@ -218,7 +127,7 @@ def main() -> None:
         uninstall()
         proc_hook.uninstall()
         proc_hook.join_children()
-        serialize(db, args.output)
+        db.serialize(args.output)
 
         child_dbs = proc_hook.child_trace_paths()
         if child_dbs:

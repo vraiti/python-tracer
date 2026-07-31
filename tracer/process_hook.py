@@ -108,15 +108,15 @@ class _TracedTarget:
             load_ast_data,
             uninstall,
         )
-        from tracer.ast_index import AstIndex
+        from tracer.ast_processor import AstProcessor
         from tracer.ipc import patch_message_queue
 
         pid = os.getpid()
         output_file = f"/tmp/{pid}.db"
 
         path_filter = PathFilter(prefixes=self.prefixes, tracked_classes=self.tracked_classes)
-        ast_index = AstIndex()
-        ast_index.preprocess(path_filter)
+        ast_processor = AstProcessor()
+        ast_processor.preprocess(path_filter)
 
         db = Database()
 
@@ -124,7 +124,7 @@ class _TracedTarget:
         hook = TraceHook(db, path_filter)
         ownership = OwnershipHook(db, hook)
 
-        load_ast_data(ast_index._func_to_id, ast_index._control_flow_lines)
+        load_ast_data(ast_processor._func_to_id, ast_processor._control_flow_lines)
 
         patch_message_queue(db)
 
@@ -137,24 +137,14 @@ class _TracedTarget:
             _original_run(self_thread)
         threading.Thread.run = _patched_run  # type: ignore
 
-        written = False
-
         def _write_trace() -> None:
-            nonlocal written
-            if written:
-                return
-            written = True
             uninstall()
             try:
-                from tracer.__main__ import serialize
-                serialize(db, output_file)
+                db.serialize(output_file)
             except Exception:
                 import traceback
                 traceback.print_exc()
 
         atexit.register(_write_trace)
 
-        try:
-            return self.original_target(*args, **kwargs)
-        finally:
-            _write_trace()
+        return self.original_target(*args, **kwargs)
