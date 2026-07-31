@@ -86,13 +86,14 @@ def reconstruct_executed_stmts(
     cf_blob: bytes | None,
 ) -> list[ast.stmt]:
     blob = cf_blob or b""
-    bi = [0]
+    bit_pos = [0]
 
     def consume() -> int:
-        if bi[0] >= len(blob):
+        byte_idx = bit_pos[0] // 8
+        if byte_idx >= len(blob):
             return 0
-        val = blob[bi[0]]
-        bi[0] += 1
+        val = (blob[byte_idx] >> (bit_pos[0] % 8)) & 1
+        bit_pos[0] += 1
         return val
 
     executed: list[ast.stmt] = []
@@ -102,7 +103,7 @@ def reconstruct_executed_stmts(
             executed.append(stmt)
 
             if isinstance(stmt, (ast.For, ast.AsyncFor)):
-                while bi[0] < len(blob):
+                while bit_pos[0] // 8 < len(blob):
                     decision = consume()
                     if decision == 1:
                         walk_body(stmt.body)
@@ -114,7 +115,7 @@ def reconstruct_executed_stmts(
                     walk_body(stmt.orelse)
 
             elif isinstance(stmt, ast.While):
-                while bi[0] < len(blob):
+                while bit_pos[0] // 8 < len(blob):
                     decision = consume()
                     if decision == 1:
                         walk_body(stmt.body)
@@ -553,6 +554,53 @@ def postprocess(db_path: str) -> None:
     ipc_edges = resolve_ipc_edges(c)
     merged.extend(ipc_edges)
 
+    # --- default_owner: map each object to its first parent ---
+
+    child_to_parents: dict[tuple[int, int], list[tuple[int, str]]] = {}
+    for (pid, parent_idx), attrs in members.items():
+        for attr, child_idx in attrs.items():
+            child_to_parents.setdefault((pid, child_idx), []).append((parent_idx, attr))
+
+    obj_init_call: dict[tuple[int, int], int] = {}
+    for (pid, obj_idx), call_id in objects.items():
+        obj_init_call[(pid, obj_idx)] = call_id
+
+    attr_write_edges: list[DataflowEdge] = [
+        e for e in merged if e.target_type == "attr_write"
+    ]
+
+    default_owners: list[tuple[int, int, int, str]] = []
+    for (pid, child_idx), parents in child_to_parents.items():
+        if len(parents) == 1:
+            owner_idx, attr = parents[0]
+            default_owners.append((pid, child_idx, owner_idx, attr))
+            continue
+
+        child_init_cid = obj_init_call.get((pid, child_idx))
+        if child_init_cid is None:
+            continue
+
+        parent_set = {p for p, _ in parents}
+        best: tuple[int, int, str] | None = None
+        for e in attr_write_edges:
+            if e.pid != pid:
+                continue
+            if e.source_call_id != child_init_cid:
+                continue
+            target_call = calls.get((e.pid, e.target_call_id))
+            if target_call is None:
+                continue
+            if target_call.obj_id in parent_set:
+                if best is None or e.target_call_id < best[0]:
+                    attr_name = e.target_name.split(".")[-1] if "." in e.target_name else e.target_name
+                    best = (e.target_call_id, target_call.obj_id, attr_name)
+
+        if best:
+            default_owners.append((pid, child_idx, best[1], best[2]))
+        else:
+            owner_idx, attr = parents[0]
+            default_owners.append((pid, child_idx, owner_idx, attr))
+
     c.executescript("""
         CREATE TABLE IF NOT EXISTS dataflow_edges (
             pid INTEGER NOT NULL,
@@ -571,6 +619,14 @@ def postprocess(db_path: str) -> None:
             line_order INTEGER NOT NULL,
             lineno INTEGER NOT NULL
         );
+        DROP TABLE IF EXISTS default_owner;
+        CREATE TABLE default_owner (
+            pid INTEGER NOT NULL,
+            obj_idx INTEGER NOT NULL,
+            owner_idx INTEGER NOT NULL,
+            attr TEXT NOT NULL,
+            PRIMARY KEY (pid, obj_idx)
+        );
     """)
 
     c.executemany(
@@ -587,12 +643,26 @@ def postprocess(db_path: str) -> None:
         all_executed,
     )
 
+    seen_owners: set[tuple[int, int]] = set()
+    deduped_owners = []
+    for row in default_owners:
+        key = (row[0], row[1])
+        if key not in seen_owners:
+            seen_owners.add(key)
+            deduped_owners.append(row)
+
+    c.executemany(
+        "INSERT INTO default_owner VALUES (?, ?, ?, ?)",
+        deduped_owners,
+    )
+
     conn.commit()
     conn.close()
 
     print(
         f"Postprocessed {db_path}: {n_resolved} calls resolved, {n_skipped} skipped, "
-        f"{len(merged)} dataflow edges, {len(all_executed)} executed lines",
+        f"{len(merged)} dataflow edges, {len(all_executed)} executed lines, "
+        f"{len(deduped_owners)} default owners",
         file=sys.stderr,
     )
 
