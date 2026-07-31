@@ -22,7 +22,6 @@ from tracer._tracer import (
 )
 from tracer.ast_index import AstIndex
 from tracer.ipc import patch_message_queue
-from tracer.postprocess import postprocess
 from tracer.process_hook import ProcessHook
 
 
@@ -130,7 +129,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="python-tracer")
     parser.add_argument("--config", type=str, default=None, help="path to YAML config with 'modules' and 'classes' keys")
     parser.add_argument("--output", type=str, default="trace.db", help="output file")
-    parser.add_argument("--no-postprocess", action="store_true", help="skip postprocessing")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="command to run")
 
     args = parser.parse_args()
@@ -185,7 +183,6 @@ def main() -> None:
         prefixes=prefixes,
         tracked_classes=tracked_classes,
         taint_patterns=taint_patterns,
-        no_postprocess=args.no_postprocess,
     )
     proc_hook.install()
 
@@ -252,9 +249,6 @@ def main() -> None:
                             print(f"Failed to merge {child_db} after 10 attempts", file=sys.stderr)
             conn.commit()
             conn.close()
-
-        if not args.no_postprocess:
-            postprocess(args.output)
 
 
 if __name__ == "__main__":

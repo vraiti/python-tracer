@@ -17,12 +17,10 @@ class ProcessHook:
         prefixes: list[str],
         tracked_classes: list[str] | None = None,
         taint_patterns: list[str] | None = None,
-        no_postprocess: bool = False,
     ) -> None:
         self.prefixes = prefixes
         self.tracked_classes = tracked_classes
         self.taint_patterns = taint_patterns
-        self.no_postprocess = no_postprocess
         self._children: list[multiprocessing.process.BaseProcess] = []
 
     def install(self) -> None:
@@ -44,7 +42,6 @@ class ProcessHook:
                     hook.prefixes,
                     tracked_classes=hook.tracked_classes,
                     taint_patterns=hook.taint_patterns,
-                    no_postprocess=hook.no_postprocess,
                 )
                 _original_process_init(
                     proc_self,
@@ -93,13 +90,11 @@ class _TracedTarget:
         prefixes: list[str],
         tracked_classes: list[str] | None = None,
         taint_patterns: list[str] | None = None,
-        no_postprocess: bool = False,
     ) -> None:
         self.original_target = original_target
         self.prefixes = prefixes
         self.tracked_classes = tracked_classes
         self.taint_patterns = taint_patterns
-        self.no_postprocess = no_postprocess
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         import threading
@@ -115,7 +110,6 @@ class _TracedTarget:
         )
         from tracer.ast_index import AstIndex
         from tracer.ipc import patch_message_queue
-        from tracer.postprocess import postprocess
 
         pid = os.getpid()
         output_file = f"/tmp/{pid}.db"
@@ -154,8 +148,6 @@ class _TracedTarget:
             try:
                 from tracer.__main__ import serialize
                 serialize(db, output_file)
-                if not self.no_postprocess:
-                    postprocess(output_file)
             except Exception:
                 import traceback
                 traceback.print_exc()
