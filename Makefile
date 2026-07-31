@@ -41,7 +41,7 @@ $(CPYTHON_STAMP): $(CPYTHON_SRCS) $(CPYTHON_BIN)
 	touch $@
 
 install: $(CPYTHON_STAMP) ext
-	$(PREFIX)/bin/pip install -e .
+	$(PREFIX)/bin/python3 -m pip install -e .
 
 clean:
 	cd $(CPYTHON_DIR) && $(MAKE) clean 2>/dev/null || true
