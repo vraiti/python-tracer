@@ -14,17 +14,6 @@ typedef struct {
     size_t n_words;
 } Bitset;
 
-/* Per-frame entry on the trace stack */
-typedef struct {
-    uint64_t call_id;
-    CallRecordData *record;
-    const Bitset *cf_bits;
-    int32_t pending_cf;
-    uint8_t *branch_buf;
-    size_t branch_len;
-    size_t branch_cap;
-} FrameEntry;
-
 /* Global trace state */
 typedef struct {
     uint64_t next_call_id;
@@ -49,10 +38,6 @@ typedef struct {
     int32_t cf_bits_len;
     int32_t cf_bits_cap;
 
-    /* Frame stack */
-    FrameEntry *frames;
-    size_t frame_count;
-    size_t frame_cap;
 } TraceState;
 
 extern TraceState g_state;

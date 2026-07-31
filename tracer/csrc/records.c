@@ -29,6 +29,8 @@ CallRecordData *db_add_call(DatabaseObject *db,
     rec->obj_id = obj_id;
     rec->control_flow = NULL;
     rec->control_flow_len = 0;
+    rec->control_flow_cap = 0;
+    rec->pending_cf = 0;
     rec->attr_reads = NULL;
     rec->attr_reads_len = 0;
     rec->attr_reads_cap = 0;
@@ -283,9 +285,11 @@ static PyObject *Database_serialize(PyObject *self, PyObject *args) {
             sqlite3_bind_int64(call_st, 4, (sqlite3_int64)caller);
             sqlite3_bind_int(call_st, 5, rec->call_lineno);
             sqlite3_bind_int(call_st, 6, rec->obj_id);
-            if (rec->control_flow && rec->control_flow_len > 0)
+            if (rec->control_flow && rec->control_flow_len > 0) {
+                int nbytes = (int)((rec->control_flow_len + 7) / 8);
                 sqlite3_bind_blob(call_st, 7, rec->control_flow,
-                                  (int)rec->control_flow_len, SQLITE_STATIC);
+                                  nbytes, SQLITE_STATIC);
+            }
             else
                 sqlite3_bind_null(call_st, 7);
             sqlite3_step(call_st);

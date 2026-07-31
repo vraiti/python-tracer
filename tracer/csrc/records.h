@@ -26,6 +26,8 @@ typedef struct {
     int32_t obj_id;
     uint8_t *control_flow;
     Py_ssize_t control_flow_len;
+    Py_ssize_t control_flow_cap;
+    int32_t pending_cf;
     AttrRecordReadData *attr_reads;
     Py_ssize_t attr_reads_len;
     Py_ssize_t attr_reads_cap;

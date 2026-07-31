@@ -53,26 +53,31 @@ static Bitset bitset_from_pyset(PyObject *pyset) {
     return bs;
 }
 
-/* ---- frame stack ---- */
+/* ---- control flow append ---- */
 
-static void frame_stack_push(FrameEntry *entry) {
-    if (g_state.frame_count >= g_state.frame_cap) {
-        g_state.frame_cap = g_state.frame_cap ? g_state.frame_cap * 2 : 64;
-        g_state.frames = realloc(g_state.frames, g_state.frame_cap * sizeof(FrameEntry));
+static void record_append_cf(CallRecordData *rec, int taken) {
+    Py_ssize_t byte_idx = rec->control_flow_len / 8;
+    int bit_idx = rec->control_flow_len % 8;
+    if (byte_idx >= rec->control_flow_cap) {
+        Py_ssize_t new_cap = rec->control_flow_cap ? rec->control_flow_cap * 2 : 8;
+        uint8_t *tmp = realloc(rec->control_flow, new_cap);
+        if (!tmp) return;
+        memset(tmp + rec->control_flow_cap, 0, new_cap - rec->control_flow_cap);
+        rec->control_flow = tmp;
+        rec->control_flow_cap = new_cap;
     }
-    g_state.frames[g_state.frame_count++] = *entry;
+    if (taken)
+        rec->control_flow[byte_idx] |= (1 << bit_idx);
+    rec->control_flow_len++;
 }
 
-static FrameEntry *frame_stack_peek(void) {
-    if (g_state.frame_count == 0) return NULL;
-    return &g_state.frames[g_state.frame_count - 1];
-}
+/* ---- record lookup by call_id ---- */
 
-static void frame_stack_pop(void) {
-    if (g_state.frame_count > 0) {
-        FrameEntry *e = &g_state.frames[--g_state.frame_count];
-        free(e->branch_buf);
-    }
+static CallRecordData *record_for_call_id(uint64_t call_id) {
+    DatabaseObject *db = (DatabaseObject *)g_state.db;
+    Py_ssize_t idx = (Py_ssize_t)(call_id - 1);
+    if (idx < 0 || idx >= db->calls_len) return NULL;
+    return &db->calls[idx];
 }
 
 /* ---- scope check ---- */
@@ -170,28 +175,6 @@ static void handle_init(PyObject *self_obj, PyCodeObject *code, uint64_t call_id
 
     if (g_state.ownership)
         ownership_patch_class(g_state.ownership, cls);
-}
-
-/* ---- push a traced frame ---- */
-
-static void push_traced_frame(uint64_t call_id, CallRecordData *record,
-                              int32_t function_id) {
-    FrameEntry entry;
-    entry.call_id = call_id;
-    entry.record = record;
-    entry.pending_cf = 0;
-    entry.branch_buf = NULL;
-    entry.branch_len = 0;
-    entry.branch_cap = 0;
-
-    if (function_id >= 0 && function_id < g_state.cf_bits_len
-            && g_state.cf_bits[function_id].max_line >= 0) {
-        entry.cf_bits = &g_state.cf_bits[function_id];
-    } else {
-        entry.cf_bits = NULL;
-    }
-
-    frame_stack_push(&entry);
 }
 
 /* ---- trace callback ---- */
@@ -299,8 +282,6 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
                             handle_init(self_obj, code, call_id);
                             int32_t obj_id = get_obj_id(self_obj);
                             rec->obj_id = obj_id;
-
-                            push_traced_frame(call_id, rec, function_id);
                         }
                     }
                 }
@@ -353,64 +334,35 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
         rec->obj_id = new_obj_id;
     }
 
-    push_traced_frame(call_id, rec, function_id);
-
     ((PyFrameObject *)py_frame)->f_trace_lines = 1;
     Py_DECREF(code);
     return 0;
 }
 
 static int handle_line(PyObject *py_frame, PyFrameObject *frame_obj) {
-    int lineno = PyFrame_GetLineNumber(frame_obj);
-    FrameEntry *entry = frame_stack_peek();
-    if (!entry) return 0;
-
-    if (entry->pending_cf > 0) {
-        int taken = (lineno == entry->pending_cf + 1);
-        if (entry->branch_len >= entry->branch_cap) {
-            entry->branch_cap = entry->branch_cap ? entry->branch_cap * 2 : 32;
-            entry->branch_buf = realloc(entry->branch_buf, entry->branch_cap);
-        }
-        entry->branch_buf[entry->branch_len++] = taken ? 1 : 0;
-        entry->pending_cf = 0;
-    }
-
-    if (entry->cf_bits &&
-        lineno <= entry->cf_bits->max_line &&
-        bitset_test(entry->cf_bits, lineno)) {
-        entry->pending_cf = lineno;
-    }
-
-    return 0;
-}
-
-static int handle_return(PyObject *py_frame, PyFrameObject *frame_obj) {
     uint64_t cid = ((PyFrameObject *)py_frame)->call_id;
     if (cid == 0 || cid == UINT64_MAX) return 0;
 
-    while (g_state.frame_count > 0) {
-        FrameEntry *entry = frame_stack_peek();
+    CallRecordData *rec = record_for_call_id(cid);
+    if (!rec) return 0;
 
-        if (entry->pending_cf > 0) {
-            if (entry->branch_len >= entry->branch_cap) {
-                entry->branch_cap = entry->branch_cap ? entry->branch_cap * 2 : 32;
-                entry->branch_buf = realloc(entry->branch_buf, entry->branch_cap);
-            }
-            entry->branch_buf[entry->branch_len++] = 0;
-            entry->pending_cf = 0;
-        }
+    int lineno = PyFrame_GetLineNumber(frame_obj);
 
-        uint64_t entry_cid = entry->call_id;
-
-        if (entry->branch_len > 0 && entry->record) {
-            entry->record->control_flow = entry->branch_buf;
-            entry->record->control_flow_len = entry->branch_len;
-            entry->branch_buf = NULL;
-        }
-
-        frame_stack_pop();
-        if (entry_cid == cid) break;
+    if (rec->pending_cf > 0) {
+        int taken = (lineno == rec->pending_cf + 1);
+        record_append_cf(rec, taken ? 1 : 0);
+        rec->pending_cf = 0;
     }
+
+    const Bitset *bits = NULL;
+    if (rec->function_id >= 0 && rec->function_id < g_state.cf_bits_len)
+        bits = &g_state.cf_bits[rec->function_id];
+    if (bits && bits->max_line >= 0 &&
+        lineno <= bits->max_line &&
+        bitset_test(bits, lineno)) {
+        rec->pending_cf = lineno;
+    }
+
     return 0;
 }
 
@@ -424,9 +376,8 @@ static int trace_func(
 
     PyObject *py_frame = (PyObject *)frame_obj;
     switch (what) {
-        case PyTrace_CALL:   return handle_call(py_frame, frame_obj);
-        case PyTrace_LINE:   return handle_line(py_frame, frame_obj);
-        case PyTrace_RETURN: return handle_return(py_frame, frame_obj);
+        case PyTrace_CALL: return handle_call(py_frame, frame_obj);
+        case PyTrace_LINE: return handle_line(py_frame, frame_obj);
         default: return 0;
     }
 }
@@ -459,7 +410,6 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
         free(g_state.taint_patterns);
     }
     umap_free(&g_state.scope_cache);
-    free(g_state.frames);
 
     /* set up new state */
     Py_INCREF(hook);
@@ -495,9 +445,6 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
     }
 
     g_state.next_call_id = 1;
-    g_state.frames = NULL;
-    g_state.frame_count = 0;
-    g_state.frame_cap = 0;
     g_state.enabled = 1;
 
     PyEval_SetTrace((Py_tracefunc)trace_func, g_state.hook_obj);
@@ -534,9 +481,11 @@ static PyObject *py_set_call_id(PyObject *self, PyObject *args) {
 }
 
 CallRecordData *current_record(void) {
-    FrameEntry *entry = frame_stack_peek();
-    if (!entry) return NULL;
-    return entry->record;
+    PyFrameObject *frame = PyEval_GetFrame();
+    if (!frame) return NULL;
+    uint64_t cid = frame->call_id;
+    if (cid == 0 || cid == UINT64_MAX) return NULL;
+    return record_for_call_id(cid);
 }
 
 static PyObject *py_load_ast_data(PyObject *self, PyObject *args) {
