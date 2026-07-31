@@ -1,0 +1,8 @@
+modules:
+  - vllm
+  - vllm_omni
+  - janus
+classes:
+  - starlette.datastructures.State
+taint-functions:
+  - _dummy_run

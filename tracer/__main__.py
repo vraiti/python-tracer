@@ -128,12 +128,9 @@ def serialize(db: Database, output: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="python-tracer")
-    parser.add_argument("--prefix", action="append", default=None, help="scope prefix (repeatable; omit to auto-detect vllm)")
-    parser.add_argument("--track-modules", type=str, default=None, help="comma-delimited list of module names to trace (resolves to package paths)")
-    parser.add_argument("--tracked", type=str, default=None, help="path to tracked.txt")
+    parser.add_argument("--config", type=str, default=None, help="path to YAML config with 'modules' and 'classes' keys")
     parser.add_argument("--output", type=str, default="trace.db", help="output file")
     parser.add_argument("--no-postprocess", action="store_true", help="skip postprocessing")
-    parser.add_argument("--taint-notrace", action="append", default=None, help="suppress tracing inside functions matching this qualname substring (repeatable)")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="command to run")
 
     args = parser.parse_args()
@@ -141,12 +138,19 @@ def main() -> None:
     if not args.command:
         parser.error("no command specified")
 
-    prefixes = args.prefix
-    if args.track_modules:
+    prefixes = None
+    tracked_classes = None
+    taint_patterns = None
+    if args.config:
         import importlib
-        prefixes = prefixes or []
-        for mod_name in args.track_modules.split(","):
-            mod_name = mod_name.strip()
+        import yaml
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+        modules = cfg.get("modules") or []
+        tracked_classes = cfg.get("classes") or []
+        taint_patterns = cfg.get("taint-functions") or None
+        prefixes = []
+        for mod_name in modules:
             try:
                 mod = importlib.import_module(mod_name)
             except ImportError:
@@ -162,7 +166,7 @@ def main() -> None:
             else:
                 prefixes.append(os.path.dirname(os.path.abspath(mod_file)))
 
-    path_filter = PathFilter(prefixes=prefixes, tracked_file=args.tracked)
+    path_filter = PathFilter(prefixes=prefixes, tracked_classes=tracked_classes)
     ast_index = AstIndex()
     ast_index.preprocess(path_filter)
 
@@ -177,13 +181,13 @@ def main() -> None:
 
     # Install trace function
     prefixes = list(path_filter._prefixes)
-    install(hook, prefixes, db, ownership, path_filter, taint_patterns=args.taint_notrace)
+    install(hook, prefixes, db, ownership, path_filter, taint_patterns=taint_patterns)
 
     # Monkey-patch multiprocessing to trace child processes
     proc_hook = ProcessHook(
         prefixes=prefixes,
-        tracked_file=args.tracked,
-        taint_patterns=args.taint_notrace,
+        tracked_classes=tracked_classes,
+        taint_patterns=taint_patterns,
         no_postprocess=args.no_postprocess,
     )
     proc_hook.install()

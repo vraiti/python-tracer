@@ -15,12 +15,12 @@ class ProcessHook:
     def __init__(
         self,
         prefixes: list[str],
-        tracked_file: str | None = None,
+        tracked_classes: list[str] | None = None,
         taint_patterns: list[str] | None = None,
         no_postprocess: bool = False,
     ) -> None:
         self.prefixes = prefixes
-        self.tracked_file = tracked_file
+        self.tracked_classes = tracked_classes
         self.taint_patterns = taint_patterns
         self.no_postprocess = no_postprocess
         self._children: list[multiprocessing.process.BaseProcess] = []
@@ -42,7 +42,7 @@ class ProcessHook:
                 wrapped = _TracedTarget(
                     target,
                     hook.prefixes,
-                    tracked_file=hook.tracked_file,
+                    tracked_classes=hook.tracked_classes,
                     taint_patterns=hook.taint_patterns,
                     no_postprocess=hook.no_postprocess,
                 )
@@ -91,13 +91,13 @@ class _TracedTarget:
         self,
         original_target: Any,
         prefixes: list[str],
-        tracked_file: str | None = None,
+        tracked_classes: list[str] | None = None,
         taint_patterns: list[str] | None = None,
         no_postprocess: bool = False,
     ) -> None:
         self.original_target = original_target
         self.prefixes = prefixes
-        self.tracked_file = tracked_file
+        self.tracked_classes = tracked_classes
         self.taint_patterns = taint_patterns
         self.no_postprocess = no_postprocess
 
@@ -120,7 +120,7 @@ class _TracedTarget:
         pid = os.getpid()
         output_file = f"/tmp/{pid}.db"
 
-        path_filter = PathFilter(prefixes=self.prefixes, tracked_file=self.tracked_file)
+        path_filter = PathFilter(prefixes=self.prefixes, tracked_classes=self.tracked_classes)
         ast_index = AstIndex()
         ast_index.preprocess(path_filter)
 

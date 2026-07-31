@@ -21,6 +21,13 @@ MODELS = {
     },
 }
 
+_configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+CONFIGS = {
+    dirent.name.rsplit(".", 1)[0]: dirent.path
+    for dirent in os.scandir(_configs_dir)
+    if dirent.is_file() and dirent.name.endswith(".yaml")
+}
+
 HEALTH_URL = "http://localhost:8000/health"
 POLL_INTERVAL = 10
 
@@ -41,7 +48,6 @@ def poll_health(server):
 
         time.sleep(POLL_INTERVAL)
 
-
 def main():
     parser = argparse.ArgumentParser(description="Run omni_tracer with vLLM-Omni")
     parser.add_argument(
@@ -50,16 +56,10 @@ def main():
         help="Model to serve",
     )
     parser.add_argument(
-        "--taint-notrace",
-        action="append",
-        default=["_dummy_run"],
-        help="Suppress tracing inside functions matching this qualname substring (repeatable)",
-    )
-    parser.add_argument(
-        "--prefix",
-        action="append",
-        default=None,
-        help="Scope prefix for tracing (repeatable; omit to auto-detect vllm_omni, vllm, janus)",
+        "--config",
+        default="default",
+        choices=list(CONFIGS),
+        help="Config file for code to trace",
     )
     parser.add_argument(
         "--no-query",
@@ -71,27 +71,16 @@ def main():
     model = MODELS[args.model]
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     output = os.path.join(base, "traces", "trace.db")
-    track_file = os.path.join(base, "tracked.txt")
     os.makedirs(os.path.dirname(output), exist_ok=True)
 
-    taint_args = []
-    if args.taint_notrace:
-        for pat in args.taint_notrace:
-            taint_args.extend(["--taint-notrace", pat])
-
-    prefix_args = []
-    prefixes = args.prefix
-    for p in prefixes:
-        prefix_args.extend(["--prefix", p])
+    config_path = CONFIGS[args.config]
 
     cmd = [
         "trace-python", "-m", "tracer",
+        "--config", config_path,
         "--output", output,
-        *(["--tracked", track_file] if os.path.exists(track_file) else []),
-        *taint_args,
-        *prefix_args,
         "--",
-        "serve", args.model, "--omni",
+        "vllm-omni", "serve", args.model, "--omni",
         *model["args"],
     ]
 

@@ -5,12 +5,13 @@ PyTypeObject *PathFilterType = NULL;
 
 static int PathFilter_init(PyObject *self, PyObject *args, PyObject *kw) {
     PathFilterObject *o = (PathFilterObject *)self;
-    static char *kwlist[] = {"prefixes", "tracked_file", NULL};
+    static char *kwlist[] = {"prefixes", "tracked_file", "tracked_classes", NULL};
     PyObject *prefixes_obj = Py_None;
     const char *tracked_file = NULL;
+    PyObject *tracked_classes_obj = Py_None;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "|Oz", kwlist,
-            &prefixes_obj, &tracked_file))
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|OzO", kwlist,
+            &prefixes_obj, &tracked_file, &tracked_classes_obj))
         return -1;
 
     o->prefixes = NULL;
@@ -102,6 +103,19 @@ static int PathFilter_init(PyObject *self, PyObject *args, PyObject *kw) {
                 smap_set(&o->tracked_classes, start, NULL);
         }
         fclose(f);
+    }
+
+    if (tracked_classes_obj != Py_None && tracked_classes_obj != NULL) {
+        if (!PyList_Check(tracked_classes_obj)) {
+            PyErr_SetString(PyExc_TypeError, "tracked_classes must be a list");
+            return -1;
+        }
+        Py_ssize_t n = PyList_GET_SIZE(tracked_classes_obj);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            const char *s = PyUnicode_AsUTF8(PyList_GET_ITEM(tracked_classes_obj, i));
+            if (!s) return -1;
+            smap_set(&o->tracked_classes, s, NULL);
+        }
     }
 
     return 0;
