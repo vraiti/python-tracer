@@ -142,7 +142,7 @@ def main() -> None:
     tracked_classes = None
     taint_patterns = None
     if args.config:
-        import importlib
+        import importlib.util
         import yaml
         with open(args.config) as f:
             cfg = yaml.safe_load(f)
@@ -151,20 +151,16 @@ def main() -> None:
         taint_patterns = cfg.get("taint-functions") or None
         prefixes = []
         for mod_name in modules:
-            try:
-                mod = importlib.import_module(mod_name)
-            except ImportError:
-                print(f"Warning: could not import module '{mod_name}'", file=sys.stderr)
+            spec = importlib.util.find_spec(mod_name)
+            if spec is None:
+                print(f"Warning: could not find module '{mod_name}'", file=sys.stderr)
                 continue
-            mod_file = getattr(mod, "__file__", None)
-            if mod_file is None:
-                print(f"Warning: module '{mod_name}' has no __file__", file=sys.stderr)
-                continue
-            pkg_path = getattr(mod, "__path__", None)
-            if pkg_path:
-                prefixes.append(pkg_path[0])
+            if spec.submodule_search_locations:
+                prefixes.append(spec.submodule_search_locations[0])
+            elif spec.origin:
+                prefixes.append(os.path.dirname(os.path.abspath(spec.origin)))
             else:
-                prefixes.append(os.path.dirname(os.path.abspath(mod_file)))
+                print(f"Warning: module '{mod_name}' has no path", file=sys.stderr)
 
     print("[__main__] Parsing AST")
     path_filter = PathFilter(prefixes=prefixes, tracked_classes=tracked_classes)
