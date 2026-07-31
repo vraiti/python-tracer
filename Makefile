@@ -31,7 +31,7 @@ $(TRACER_SO): $(TRACER_SRCS) $(TRACER_HDRS)
 cpython: $(CPYTHON_BIN)
 
 $(CPYTHON_BIN):
-	cd $(CPYTHON_DIR) && ./configure --prefix=$(PREFIX) && $(MAKE) -j$(NPROC)
+	cd $(CPYTHON_DIR) && CONFIG_SHELL=/bin/sh ./configure --prefix=$(PREFIX) && $(MAKE) -j$(NPROC)
 
 SITE_PACKAGES := $(PREFIX)/lib/python3.12/site-packages
 TRACER_DEST := $(SITE_PACKAGES)/tracer

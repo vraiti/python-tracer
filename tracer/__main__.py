@@ -129,6 +129,7 @@ def serialize(db: Database, output: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="python-tracer")
     parser.add_argument("--prefix", action="append", default=None, help="scope prefix (repeatable; omit to auto-detect vllm)")
+    parser.add_argument("--track-modules", type=str, default=None, help="comma-delimited list of module names to trace (resolves to package paths)")
     parser.add_argument("--tracked", type=str, default=None, help="path to tracked.txt")
     parser.add_argument("--output", type=str, default="trace.db", help="output file")
     parser.add_argument("--no-postprocess", action="store_true", help="skip postprocessing")
@@ -140,7 +141,28 @@ def main() -> None:
     if not args.command:
         parser.error("no command specified")
 
-    path_filter = PathFilter(prefixes=args.prefix, tracked_file=args.tracked)
+    prefixes = args.prefix
+    if args.track_modules:
+        import importlib
+        prefixes = prefixes or []
+        for mod_name in args.track_modules.split(","):
+            mod_name = mod_name.strip()
+            try:
+                mod = importlib.import_module(mod_name)
+            except ImportError:
+                print(f"Warning: could not import module '{mod_name}'", file=sys.stderr)
+                continue
+            mod_file = getattr(mod, "__file__", None)
+            if mod_file is None:
+                print(f"Warning: module '{mod_name}' has no __file__", file=sys.stderr)
+                continue
+            pkg_path = getattr(mod, "__path__", None)
+            if pkg_path:
+                prefixes.append(pkg_path[0])
+            else:
+                prefixes.append(os.path.dirname(os.path.abspath(mod_file)))
+
+    path_filter = PathFilter(prefixes=prefixes, tracked_file=args.tracked)
     ast_index = AstIndex()
     ast_index.preprocess(path_filter)
 
