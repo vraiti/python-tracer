@@ -166,6 +166,7 @@ def main() -> None:
             else:
                 prefixes.append(os.path.dirname(os.path.abspath(mod_file)))
 
+    print("[__main__] Parsing AST")
     path_filter = PathFilter(prefixes=prefixes, tracked_classes=tracked_classes)
     ast_index = AstIndex()
     ast_index.preprocess(path_filter)

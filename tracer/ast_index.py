@@ -28,7 +28,6 @@ class AstIndex:
 
     def _process_file(self, filepath: str) -> None:
         try:
-            print(f"[ast_index]: processing {filepath}")
             with open(filepath) as f:
                 source = f.read()
             tree = ast.parse(source, filepath)
