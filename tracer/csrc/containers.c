@@ -285,6 +285,10 @@ static PyObject *TracedDict_reduce(PyObject *self, PyObject *Py_UNUSED(args)) {
     return result;
 }
 
+static PyObject *TracedDict_copy(PyObject *self, PyObject *Py_UNUSED(args)) {
+    return PyDict_Copy(((TracedDictObject *)self)->inner);
+}
+
 static PyObject *TracedDict_get_wrapped(PyObject *self, void *closure) {
     Py_RETURN_TRUE;
 }
@@ -299,6 +303,7 @@ static PyMethodDef TracedDict_methods[] = {
     {"values",     TracedDict_values,                  METH_NOARGS, NULL},
     {"items",      TracedDict_items,                   METH_NOARGS, NULL},
     {"__reduce__", TracedDict_reduce,                  METH_NOARGS, NULL},
+    {"copy",       TracedDict_copy,                    METH_NOARGS, NULL},
     {NULL}
 };
 
