@@ -552,7 +552,8 @@ void ownership_patch_class(PyObject *ownership, PyObject *cls) {
     Py_DECREF(orig_getattr);
     if (!traced_get) { Py_DECREF(traced_set); PyErr_Clear(); return; }
 
-    /* skip both patches — diagnosing segfault */
+    /* skip __setattr__ patch — diagnosing segfault */
+    PyObject_SetAttrString(cls, "__getattribute__", traced_get);
     Py_DECREF(traced_set);
     Py_DECREF(traced_get);
 }
