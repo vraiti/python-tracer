@@ -137,54 +137,7 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
                 PyErr_Clear();
             }
 
-            /* wrap containers */
-            PyObject *value_type = (PyObject *)Py_TYPE(value);
-            int is_dict = PyDict_Check(value);
-            int is_list = PyList_Check(value);
-            int is_deque = 0;
-            if (!is_dict && !is_list) {
-                PyObject *qn = PyObject_GetAttrString(value_type, "__qualname__");
-                if (qn) {
-                    const char *qns = PyUnicode_AsUTF8(qn);
-                    if (qns && strcmp(qns, "deque") == 0) is_deque = 1;
-                    Py_DECREF(qn);
-                }
-            }
-
-            int is_wrapped = 0;
-            PyObject *tw = PyObject_GetAttrString(value, "_tr_wrapped");
-            if (tw) {
-                is_wrapped = PyObject_IsTrue(tw);
-                Py_DECREF(tw);
-            } else {
-                PyErr_Clear();
-            }
-
-            if (0 && (is_dict || is_list || is_deque) && !is_wrapped) {
-                PyObject *wrapped = wrap_container_inner(
-                    value, ts->db, ts->trace_hook, (int)obj_idx, name_str);
-                if (wrapped) {
-                    if (object_type) {
-                        /* object_type was already decref'd above, re-fetch */
-                        PyObject *b2 = PyImport_ImportModule("builtins");
-                        PyObject *ot2 = b2 ? PyObject_GetAttrString(b2, "object") : NULL;
-                        Py_XDECREF(b2);
-                        if (ot2) {
-                            PyObject *sa2 = PyObject_GetAttrString(ot2, "__setattr__");
-                            if (sa2) {
-                                PyObject *r3 = PyObject_CallFunctionObjArgs(
-                                    sa2, self_obj, name, wrapped, NULL);
-                                Py_XDECREF(r3);
-                                Py_DECREF(sa2);
-                            }
-                            Py_DECREF(ot2);
-                        }
-                    }
-                    Py_DECREF(wrapped);
-                } else {
-                    PyErr_Clear();
-                }
-            }
+            (void)0;
         } else {
             PyErr_Clear();
         }
