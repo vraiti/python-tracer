@@ -2,6 +2,7 @@ PREFIX ?= /opt/trace-python
 CPYTHON_DIR := cpython
 CPYTHON_BIN := $(CPYTHON_DIR)/python
 NPROC := $(shell nproc)
+USER := $(shell whoami)
 
 CC ?= gcc
 
@@ -36,7 +37,12 @@ cpython: $(CPYTHON_BIN)
 $(CPYTHON_BIN):
 	cd $(CPYTHON_DIR) && CONFIG_SHELL=/bin/sh ./configure --prefix=$(PREFIX) && $(MAKE) -j$(NPROC)
 
-$(CPYTHON_STAMP): $(CPYTHON_SRCS) $(CPYTHON_BIN)
+$(PREFIX):
+	sudo mkdir -p $(PREFIX)
+	sudo chown $(USER):$(USER) $(PREFIX)
+	
+
+$(CPYTHON_STAMP): $(CPYTHON_SRCS) $(CPYTHON_BIN) $(PREFIX)
 	cd $(CPYTHON_DIR) && $(MAKE) -j$(NPROC) && $(MAKE) install
 	touch $@
 
