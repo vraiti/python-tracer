@@ -1,4 +1,5 @@
 #include "ownership.h"
+#include "hook.h"
 #include "internal/pycore_frame.h"
 #include <string.h>
 
