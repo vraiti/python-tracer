@@ -126,6 +126,27 @@ static int32_t get_obj_id(PyObject *self_obj) {
     return (int32_t)val;
 }
 
+static int is_tracked_class(PyObject *self_obj) {
+    PathFilterObject *pf = (PathFilterObject *)g_state.filter;
+    if (!pf) return 0;
+    PyObject *cls = (PyObject *)Py_TYPE(self_obj);
+    PyObject *module = PyObject_GetAttrString(cls, "__module__");
+    PyObject *qualname_attr = PyObject_GetAttrString(cls, "__qualname__");
+    int result = 0;
+    if (module && qualname_attr) {
+        const char *mod_str = PyUnicode_AsUTF8(module);
+        const char *qual_str = PyUnicode_AsUTF8(qualname_attr);
+        if (mod_str && qual_str) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s.%s", mod_str, qual_str);
+            result = smap_contains(&pf->tracked_classes, buf);
+        }
+    }
+    Py_XDECREF(module);
+    Py_XDECREF(qualname_attr);
+    return result;
+}
+
 /* ---- handle_init: create ObjectRecord, set __tr_idx, patch class ---- */
 
 static void handle_init(PyObject *self_obj, PyCodeObject *code, uint64_t call_id) {
@@ -350,11 +371,12 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
     if (!rec) { PyErr_Clear(); Py_DECREF(code); return 0; }
     PyList_Append(db->calls, rec);
 
-    /* __init__ handling for in-scope calls */
+    /* __init__ handling for in-scope calls (tracked classes only) */
     Py_ssize_t name_size;
     const char *co_name_str = PyUnicode_AsUTF8AndSize(code->co_name, &name_size);
     if (co_name_str && self_obj &&
-        name_size == 8 && memcmp(co_name_str, "__init__", 8) == 0) {
+        name_size == 8 && memcmp(co_name_str, "__init__", 8) == 0 &&
+        is_tracked_class(self_obj)) {
         handle_init(self_obj, code, call_id);
         int32_t new_obj_id = get_obj_id(self_obj);
         ((CallRecordObject *)rec)->obj_id = new_obj_id;
