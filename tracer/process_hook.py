@@ -69,9 +69,9 @@ class ProcessHook:
     def uninstall(self) -> None:
         multiprocessing.process.BaseProcess.__init__ = _original_process_init
 
-    def join_children(self, timeout: float = 30) -> None:
+    def join_children(self) -> None:
         for child in self._children:
-            child.join(timeout=timeout)
+            child.join()
 
     def child_trace_paths(self) -> list[str]:
         paths = []
