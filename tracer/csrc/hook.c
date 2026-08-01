@@ -126,9 +126,20 @@ static int32_t get_obj_id(PyObject *self_obj) {
     return (int32_t)val;
 }
 
-static int is_tracked_class(PyObject *self_obj) {
+static int is_tracked_class(PyObject *self_obj, PyCodeObject *code) {
     PathFilterObject *pf = (PathFilterObject *)g_state.filter;
     if (!pf) return 0;
+
+    /* Check if the __init__'s source file is under a traced prefix */
+    const char *filename = PyUnicode_AsUTF8(code->co_filename);
+    if (filename) {
+        for (Py_ssize_t i = 0; i < pf->prefix_count; i++) {
+            if (strncmp(filename, pf->prefixes[i], strlen(pf->prefixes[i])) == 0)
+                return 1;
+        }
+    }
+
+    /* Check explicit tracked_classes list */
     PyObject *cls = (PyObject *)Py_TYPE(self_obj);
     PyObject *module = PyObject_GetAttrString(cls, "__module__");
     PyObject *qualname_attr = PyObject_GetAttrString(cls, "__qualname__");
@@ -270,63 +281,42 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
         const char *name = PyUnicode_AsUTF8AndSize(co_name, &name_size);
         if (name && name_size == 8 && memcmp(name, "__init__", 8) == 0) {
             PyObject *self_obj = get_self_obj(py_frame, code);
-            if (self_obj) {
-                PathFilterObject *pf = (PathFilterObject *)g_state.filter;
-                if (pf) {
-                    PyObject *cls = (PyObject *)Py_TYPE(self_obj);
-                    PyObject *module = PyObject_GetAttrString(cls, "__module__");
-                    PyObject *qualname_attr = PyObject_GetAttrString(cls, "__qualname__");
-                    int should_trace = 0;
-                    if (module && qualname_attr) {
-                        const char *mod_str = PyUnicode_AsUTF8(module);
-                        const char *qual_str = PyUnicode_AsUTF8(qualname_attr);
-                        if (mod_str && qual_str) {
-                            char buf[512];
-                            snprintf(buf, sizeof(buf), "%s.%s", mod_str, qual_str);
-                            should_trace = smap_contains(&pf->tracked_classes, buf);
-                        }
-                    }
-                    Py_XDECREF(module);
-                    Py_XDECREF(qualname_attr);
+            if (self_obj && is_tracked_class(self_obj, code)) {
+                uint64_t call_id = g_state.next_call_id++;
+                uint64_t caller_id = 0;
+                int call_lineno = 0;
+                PyFrameObject *back2 = PyFrame_GetBack(frame_obj);
+                if (back2) {
+                    caller_id = ((PyFrameObject *)back2)->call_id;
+                    call_lineno = PyFrame_GetLineNumber(back2);
+                    Py_DECREF((PyObject *)back2);
+                }
 
-                    if (should_trace) {
-                        uint64_t call_id = g_state.next_call_id++;
-                        uint64_t caller_id = 0;
-                        int call_lineno = 0;
-                        PyFrameObject *back2 = PyFrame_GetBack(frame_obj);
-                        if (back2) {
-                            caller_id = ((PyFrameObject *)back2)->call_id;
-                            call_lineno = PyFrame_GetLineNumber(back2);
-                            Py_DECREF((PyObject *)back2);
-                        }
+                Py_ssize_t qn_sz;
+                const char *qn = PyUnicode_AsUTF8AndSize(code->co_qualname, &qn_sz);
+                if (qn) {
+                    char ref_buf[1024];
+                    snprintf(ref_buf, sizeof(ref_buf), "%s:%s", filename, qn);
+                    int32_t function_id = get_or_assign_function_id(ref_buf);
 
-                        Py_ssize_t qn_sz;
-                        const char *qn = PyUnicode_AsUTF8AndSize(code->co_qualname, &qn_sz);
-                        if (qn) {
-                            char ref_buf[1024];
-                            snprintf(ref_buf, sizeof(ref_buf), "%s:%s", filename, qn);
-                            int32_t function_id = get_or_assign_function_id(ref_buf);
+                    ((PyFrameObject *)py_frame)->call_id = call_id;
+                    ((PyFrameObject *)py_frame)->f_trace_lines = 1;
 
-                            ((PyFrameObject *)py_frame)->call_id = call_id;
-                            ((PyFrameObject *)py_frame)->f_trace_lines = 1;
+                    DatabaseObject *db = (DatabaseObject *)g_state.db;
+                    PyObject *rec = PyObject_CallFunction(
+                        (PyObject *)CallRecordType,
+                        "KiKii", call_id, function_id, caller_id, call_lineno, 0);
+                    if (rec) {
+                        PyList_Append(db->calls, rec);
 
-                            DatabaseObject *db = (DatabaseObject *)g_state.db;
-                            PyObject *rec = PyObject_CallFunction(
-                                (PyObject *)CallRecordType,
-                                "KiKii", call_id, function_id, caller_id, call_lineno, 0);
-                            if (rec) {
-                                PyList_Append(db->calls, rec);
+                        handle_init(self_obj, code, call_id);
+                        int32_t obj_id = get_obj_id(self_obj);
+                        ((CallRecordObject *)rec)->obj_id = obj_id;
 
-                                handle_init(self_obj, code, call_id);
-                                int32_t obj_id = get_obj_id(self_obj);
-                                ((CallRecordObject *)rec)->obj_id = obj_id;
-
-                                push_traced_frame(call_id, rec, ref_buf);
-                                Py_DECREF(rec);
-                            } else {
-                                PyErr_Clear();
-                            }
-                        }
+                        push_traced_frame(call_id, rec, ref_buf);
+                        Py_DECREF(rec);
+                    } else {
+                        PyErr_Clear();
                     }
                 }
             }
@@ -376,7 +366,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
     const char *co_name_str = PyUnicode_AsUTF8AndSize(code->co_name, &name_size);
     if (co_name_str && self_obj &&
         name_size == 8 && memcmp(co_name_str, "__init__", 8) == 0 &&
-        is_tracked_class(self_obj)) {
+        is_tracked_class(self_obj, code)) {
         handle_init(self_obj, code, call_id);
         int32_t new_obj_id = get_obj_id(self_obj);
         ((CallRecordObject *)rec)->obj_id = new_obj_id;
