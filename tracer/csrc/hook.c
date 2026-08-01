@@ -134,7 +134,7 @@ static int is_tracked_class(PyObject *self_obj, PyCodeObject *code) {
     const char *filename = PyUnicode_AsUTF8(code->co_filename);
     if (filename) {
         for (Py_ssize_t i = 0; i < pf->prefix_count; i++) {
-            if (strncmp(fn, pf->prefixes[i], strlen(pf->prefixes[i])) == 0)
+            if (strncmp(filename, pf->prefixes[i], strlen(pf->prefixes[i])) == 0)
                 return 1;
         }
     }
