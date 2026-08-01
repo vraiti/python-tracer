@@ -160,7 +160,7 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
                 PyErr_Clear();
             }
 
-            if ((is_dict || is_list || is_deque) && !is_wrapped) {
+            if (0 && (is_dict || is_list || is_deque) && !is_wrapped) {
                 PyObject *wrapped = wrap_container_inner(
                     value, ts->db, ts->trace_hook, (int)obj_idx, name_str);
                 if (wrapped) {
@@ -552,7 +552,7 @@ void ownership_patch_class(PyObject *ownership, PyObject *cls) {
     Py_DECREF(orig_getattr);
     if (!traced_get) { Py_DECREF(traced_set); PyErr_Clear(); return; }
 
-    /* skip __setattr__ patch — diagnosing segfault */
+    PyObject_SetAttrString(cls, "__setattr__", traced_set);
     PyObject_SetAttrString(cls, "__getattribute__", traced_get);
     Py_DECREF(traced_set);
     Py_DECREF(traced_get);
