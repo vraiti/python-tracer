@@ -3,3 +3,4 @@ traces
 **/*.so
 **/__pycache__
 **/.stamp
+*.egg-info

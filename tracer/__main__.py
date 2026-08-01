@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import os
+import shutil
 import signal
 import sqlite3
 import sys
+import tempfile
 import threading
 from typing import Any
 
@@ -134,6 +137,23 @@ def serialize(db: Database, output: str) -> None:
     print(f"Trace written to {output} ({n_calls} calls, {n_objects} objects, {n_ipc} ipc)", file=sys.stderr)
 
 
+def _wait_for_traces(output_dir: str) -> None:
+    import time
+    while True:
+        pids = []
+        for name in os.listdir(output_dir):
+            if name.endswith(".db"):
+                try:
+                    pids.append(int(name[:-3]))
+                except ValueError:
+                    continue
+        alive = [pid for pid in pids if os.path.exists(f"/proc/{pid}")]
+        if not alive:
+            return
+        print(f"Waiting for {len(alive)} traced process(es) to exit: {alive}", file=sys.stderr)
+        time.sleep(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="python-tracer")
     parser.add_argument("--config", type=str, default=None, help="path to YAML config with 'modules' and 'classes' keys")
@@ -187,9 +207,12 @@ def main() -> None:
     prefixes = list(path_filter._prefixes)
     install(hook, prefixes, db, ownership, path_filter, taint_patterns=taint_patterns)
 
-    # Monkey-patch multiprocessing to trace child processes
+    output_dir = args.output + ".d"
+    os.makedirs(output_dir, exist_ok=True)
+
     proc_hook = ProcessHook(
         prefixes=prefixes,
+        output_dir=output_dir,
         tracked_classes=tracked_classes,
         taint_patterns=taint_patterns,
     )
@@ -253,18 +276,21 @@ def main() -> None:
             _uninstalled = True
         signal.signal = _orig_signal  # type: ignore
         proc_hook.uninstall()
-        proc_hook.join_children()
-        serialize(db, args.output)
 
-        child_dbs = proc_hook.child_trace_paths()
-        if child_dbs:
-            import time as _time
-            conn = sqlite3.connect(args.output)
-            for child_db in child_dbs:
-                print(f"Merging child trace {child_db}", file=sys.stderr)
-                for attempt in range(10):
+        _wait_for_traces(output_dir)
+
+        all_dbs = sorted(glob.glob(os.path.join(output_dir, "*.db")))
+        if all_dbs:
+            fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=os.path.dirname(os.path.abspath(args.output)))
+            os.close(fd)
+            first, rest = all_dbs[0], all_dbs[1:]
+            shutil.copy2(first, tmp_path)
+            if rest:
+                conn = sqlite3.connect(tmp_path)
+                for db_path in rest:
+                    print(f"Merging {db_path}", file=sys.stderr)
                     try:
-                        conn.execute("ATTACH DATABASE ? AS child", (child_db,))
+                        conn.execute("ATTACH DATABASE ? AS child", (db_path,))
                         conn.execute("INSERT OR IGNORE INTO meta SELECT * FROM child.meta")
                         conn.execute("INSERT OR IGNORE INTO functions SELECT * FROM child.functions")
                         conn.execute("INSERT INTO calls SELECT * FROM child.calls")
@@ -273,19 +299,17 @@ def main() -> None:
                         conn.execute("INSERT INTO members SELECT * FROM child.members")
                         conn.execute("INSERT INTO ipc SELECT * FROM child.ipc")
                         conn.execute("DETACH DATABASE child")
-                        break
                     except sqlite3.Error as e:
+                        print(f"Failed to merge {db_path}: {e}", file=sys.stderr)
                         try:
                             conn.rollback()
                             conn.execute("DETACH DATABASE child")
                         except Exception:
                             pass
-                        if attempt < 9:
-                            _time.sleep(1)
-                        else:
-                            print(f"Failed to merge {child_db} after 10 attempts: {e}", file=sys.stderr)
-            conn.commit()
-            conn.close()
+                conn.commit()
+                conn.close()
+            shutil.rmtree(output_dir)
+            os.rename(tmp_path, args.output)
 
 
 if __name__ == "__main__":

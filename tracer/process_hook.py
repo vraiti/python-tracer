@@ -15,13 +15,14 @@ class ProcessHook:
     def __init__(
         self,
         prefixes: list[str],
+        output_dir: str,
         tracked_classes: list[str] | None = None,
         taint_patterns: list[str] | None = None,
     ) -> None:
         self.prefixes = prefixes
+        self.output_dir = output_dir
         self.tracked_classes = tracked_classes
         self.taint_patterns = taint_patterns
-        self._children: list[multiprocessing.process.BaseProcess] = []
 
     def install(self) -> None:
         hook = self
@@ -40,6 +41,7 @@ class ProcessHook:
                 wrapped = _TracedTarget(
                     target,
                     hook.prefixes,
+                    output_dir=hook.output_dir,
                     tracked_classes=hook.tracked_classes,
                     taint_patterns=hook.taint_patterns,
                 )
@@ -62,25 +64,11 @@ class ProcessHook:
                     kwargs=kwargs if kwargs is not None else {},
                     daemon=daemon,
                 )
-            hook._children.append(proc_self)
-
         multiprocessing.process.BaseProcess.__init__ = _patched_init
 
     def uninstall(self) -> None:
         multiprocessing.process.BaseProcess.__init__ = _original_process_init
 
-    def join_children(self) -> None:
-        for child in self._children:
-            child.join()
-
-    def child_trace_paths(self) -> list[str]:
-        paths = []
-        for child in self._children:
-            if child.pid is not None:
-                p = f"/tmp/{child.pid}.db"
-                if os.path.exists(p):
-                    paths.append(p)
-        return paths
 
 
 class _TracedTarget:
@@ -88,11 +76,13 @@ class _TracedTarget:
         self,
         original_target: Any,
         prefixes: list[str],
+        output_dir: str,
         tracked_classes: list[str] | None = None,
         taint_patterns: list[str] | None = None,
     ) -> None:
         self.original_target = original_target
         self.prefixes = prefixes
+        self.output_dir = output_dir
         self.tracked_classes = tracked_classes
         self.taint_patterns = taint_patterns
 
@@ -112,7 +102,7 @@ class _TracedTarget:
         from tracer.ipc import patch_message_queue
 
         pid = os.getpid()
-        output_file = f"/tmp/{pid}.db"
+        output_file = os.path.join(self.output_dir, f"{pid}.db")
 
         path_filter = PathFilter(prefixes=self.prefixes, tracked_classes=self.tracked_classes)
         ast_index = AstIndex()
