@@ -105,6 +105,7 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
         if (sa) {
             PyObject *arw_name = PyUnicode_FromString(arw_key);
             PyObject *r2 = PyObject_CallFunctionObjArgs(sa, self_obj, arw_name, arw, NULL);
+            if (!r2) PyErr_Clear();
             Py_XDECREF(r2);
             Py_DECREF(arw_name);
             Py_DECREF(sa);
