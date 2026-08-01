@@ -11,11 +11,10 @@ typedef struct {
     int32_t call_lineno;
 } ArwEntry;
 
-/* ---- TracedDict ---- */
+/* ---- TracedDict (subclasses dict) ---- */
 
 typedef struct {
-    PyObject_HEAD
-    PyObject *inner;      /* dict */
+    PyDictObject dict;
     UMap arws;            /* hash(key) -> heap ArwEntry* (cast to intptr_t) */
     PyObject *db;
     PyObject *trace_hook;
@@ -23,11 +22,10 @@ typedef struct {
 
 extern PyTypeObject *TracedDictType;
 
-/* ---- TracedList ---- */
+/* ---- TracedList (subclasses list) ---- */
 
 typedef struct {
-    PyObject_HEAD
-    PyObject *inner;      /* list */
+    PyListObject list;
     ArwEntry *arws;
     size_t arw_count;
     size_t arw_cap;
@@ -37,7 +35,7 @@ typedef struct {
 
 extern PyTypeObject *TracedListType;
 
-/* ---- TracedDeque ---- */
+/* ---- TracedDeque (wrapper) ---- */
 
 typedef struct {
     PyObject_HEAD

@@ -46,7 +46,7 @@ static uint64_t pyobj_keyhash(PyObject *key) {
 }
 
 /* ======================================================================== */
-/* TracedDict                                                                */
+/* TracedDict  (subclasses dict)                                             */
 /* ======================================================================== */
 
 PyTypeObject *TracedDictType = NULL;
@@ -61,13 +61,13 @@ static int TracedDict_init(PyObject *self, PyObject *args, PyObject *kw) {
             &source, &db, &trace_hook, &owner_idx, &attr))
         return -1;
 
-    Py_INCREF(source);
-    o->inner = source;
+    if (PyDict_Update(self, source) < 0) return -1;
+
     Py_INCREF(db); o->db = db;
     Py_INCREF(trace_hook); o->trace_hook = trace_hook;
     umap_init(&o->arws, 32);
 
-    PyObject *keys = PyDict_Keys(source);
+    PyObject *keys = PyDict_Keys(self);
     if (keys) {
         Py_ssize_t n = PyList_GET_SIZE(keys);
         for (Py_ssize_t i = 0; i < n; i++) {
@@ -83,7 +83,6 @@ static int TracedDict_init(PyObject *self, PyObject *args, PyObject *kw) {
 static void TracedDict_dealloc(PyObject *self) {
     TracedDictObject *o = (TracedDictObject *)self;
     PyObject_GC_UnTrack(self);
-    Py_XDECREF(o->inner);
     Py_XDECREF(o->db);
     Py_XDECREF(o->trace_hook);
     if (o->arws.entries) {
@@ -92,30 +91,29 @@ static void TracedDict_dealloc(PyObject *self) {
                 free((void *)o->arws.entries[i].value);
     }
     umap_free(&o->arws);
-    Py_TYPE(self)->tp_free(self);
+    PyDict_Type.tp_dealloc(self);
 }
 
 static int TracedDict_traverse(PyObject *self, visitproc visit, void *arg) {
     TracedDictObject *o = (TracedDictObject *)self;
-    Py_VISIT(o->inner); Py_VISIT(o->db); Py_VISIT(o->trace_hook);
-    return 0;
+    Py_VISIT(o->db); Py_VISIT(o->trace_hook);
+    return PyDict_Type.tp_traverse(self, visit, arg);
 }
 
 static int TracedDict_clear_gc(PyObject *self) {
     TracedDictObject *o = (TracedDictObject *)self;
-    Py_CLEAR(o->inner); Py_CLEAR(o->db); Py_CLEAR(o->trace_hook);
-    return 0;
+    Py_CLEAR(o->db); Py_CLEAR(o->trace_hook);
+    return PyDict_Type.tp_clear(self);
 }
 
 static Py_ssize_t TracedDict_len(PyObject *self) {
-    return PyDict_Size(((TracedDictObject *)self)->inner);
+    return PyDict_Size(self);
 }
 
 static int TracedDict_ass_sub(PyObject *self, PyObject *key, PyObject *value) {
     TracedDictObject *o = (TracedDictObject *)self;
     if (value == NULL) {
-        /* __delitem__ */
-        if (PyDict_DelItem(o->inner, key) < 0) return -1;
+        if (PyDict_DelItem(self, key) < 0) return -1;
         uint64_t h = pyobj_keyhash(key);
         intptr_t old;
         if (umap_get(&o->arws, (uintptr_t)h, &old)) {
@@ -124,8 +122,7 @@ static int TracedDict_ass_sub(PyObject *self, PyObject *key, PyObject *value) {
         }
         return 0;
     }
-    /* __setitem__ */
-    if (PyDict_SetItem(o->inner, key, value) < 0) return -1;
+    if (PyDict_SetItem(self, key, value) < 0) return -1;
     uint64_t h = pyobj_keyhash(key);
     intptr_t old;
     ArwEntry *e;
@@ -141,7 +138,7 @@ static int TracedDict_ass_sub(PyObject *self, PyObject *key, PyObject *value) {
 
 static PyObject *TracedDict_subscript(PyObject *self, PyObject *key) {
     TracedDictObject *o = (TracedDictObject *)self;
-    PyObject *val = PyDict_GetItemWithError(o->inner, key);
+    PyObject *val = PyDict_GetItemWithError(self, key);
     if (!val) {
         if (!PyErr_Occurred())
             PyErr_SetObject(PyExc_KeyError, key);
@@ -156,27 +153,22 @@ static PyObject *TracedDict_subscript(PyObject *self, PyObject *key) {
 }
 
 static int TracedDict_contains(PyObject *self, PyObject *key) {
-    return PyDict_Contains(((TracedDictObject *)self)->inner, key);
+    return PyDict_Contains(self, key);
 }
 
 static PyObject *TracedDict_repr(PyObject *self) {
-    TracedDictObject *o = (TracedDictObject *)self;
-    PyObject *r = PyObject_Repr(o->inner);
+    PyObject *r = PyDict_Type.tp_repr(self);
     if (!r) return NULL;
     PyObject *result = PyUnicode_FromFormat("TracedDict(%U)", r);
     Py_DECREF(r);
     return result;
 }
 
-static PyObject *TracedDict_iter(PyObject *self) {
-    return PyObject_GetIter(((TracedDictObject *)self)->inner);
-}
-
 static PyObject *TracedDict_get(PyObject *self, PyObject *args) {
     TracedDictObject *o = (TracedDictObject *)self;
     PyObject *key, *def = Py_None;
     if (!PyArg_ParseTuple(args, "O|O", &key, &def)) return NULL;
-    PyObject *val = PyDict_GetItemWithError(o->inner, key);
+    PyObject *val = PyDict_GetItemWithError(self, key);
     if (val) {
         uint64_t h = pyobj_keyhash(key);
         intptr_t arw_ptr;
@@ -199,22 +191,50 @@ static PyObject *TracedDict_pop(PyObject *self, PyObject *args) {
     intptr_t arw_ptr;
     if (umap_get(&o->arws, (uintptr_t)h, &arw_ptr))
         emit_read((ArwEntry *)arw_ptr);
-    PyObject *result;
-    if (def)
-        result = PyObject_CallMethod(o->inner, "pop", "OO", key, def);
-    else
-        result = PyObject_CallMethod(o->inner, "pop", "(O)", key);
-    return result;
+    PyObject *val = PyDict_GetItemWithError(self, key);
+    if (val) {
+        Py_INCREF(val);
+        PyDict_DelItem(self, key);
+        if (umap_get(&o->arws, (uintptr_t)h, &arw_ptr)) {
+            free((void *)arw_ptr);
+            umap_set(&o->arws, (uintptr_t)h, (intptr_t)0);
+        }
+        return val;
+    }
+    if (PyErr_Occurred()) return NULL;
+    if (def) {
+        Py_INCREF(def);
+        return def;
+    }
+    PyErr_SetObject(PyExc_KeyError, key);
+    return NULL;
 }
 
 static PyObject *TracedDict_update(PyObject *self, PyObject *args, PyObject *kw) {
     TracedDictObject *o = (TracedDictObject *)self;
-    PyObject *result = PyObject_Call(
-        PyObject_GetAttrString(o->inner, "update"), args, kw);
+    PyObject *name = PyUnicode_InternFromString("update");
+    PyObject *descr = _PyType_Lookup(&PyDict_Type, name);
+    Py_DECREF(name);
+    if (!descr) {
+        PyErr_SetString(PyExc_RuntimeError, "dict.update not found");
+        return NULL;
+    }
+    descrgetfunc f = Py_TYPE(descr)->tp_descr_get;
+    PyObject *bound;
+    if (f) {
+        bound = f(descr, self, (PyObject *)Py_TYPE(self));
+        if (!bound) return NULL;
+    } else {
+        Py_INCREF(descr);
+        bound = descr;
+    }
+    PyObject *result = PyObject_Call(bound, args, kw);
+    Py_DECREF(bound);
     if (!result) return NULL;
     Py_DECREF(result);
+
     ArwEntry arw = caller_arw();
-    PyObject *keys = PyDict_Keys(o->inner);
+    PyObject *keys = PyDict_Keys(self);
     if (keys) {
         Py_ssize_t n = PyList_GET_SIZE(keys);
         for (Py_ssize_t i = 0; i < n; i++) {
@@ -231,12 +251,10 @@ static PyObject *TracedDict_update(PyObject *self, PyObject *args, PyObject *kw)
 }
 
 static PyObject *TracedDict_setdefault(PyObject *self, PyObject *args) {
-    TracedDictObject *o = (TracedDictObject *)self;
     PyObject *key, *def = Py_None;
     if (!PyArg_ParseTuple(args, "O|O", &key, &def)) return NULL;
-    if (PyDict_Contains(o->inner, key)) {
+    if (PyDict_Contains(self, key))
         return TracedDict_subscript(self, key);
-    }
     TracedDict_ass_sub(self, key, def);
     Py_INCREF(def);
     return def;
@@ -244,7 +262,7 @@ static PyObject *TracedDict_setdefault(PyObject *self, PyObject *args) {
 
 static PyObject *TracedDict_clear(PyObject *self, PyObject *Py_UNUSED(args)) {
     TracedDictObject *o = (TracedDictObject *)self;
-    PyDict_Clear(o->inner);
+    PyDict_Clear(self);
     if (o->arws.entries) {
         for (size_t i = 0; i < o->arws.capacity; i++)
             if (o->arws.entries[i].occupied && o->arws.entries[i].value)
@@ -256,25 +274,24 @@ static PyObject *TracedDict_clear(PyObject *self, PyObject *Py_UNUSED(args)) {
 }
 
 static PyObject *TracedDict_keys(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyDict_Keys(((TracedDictObject *)self)->inner);
+    return PyDict_Keys(self);
 }
 
 static PyObject *TracedDict_values(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyDict_Values(((TracedDictObject *)self)->inner);
+    return PyDict_Values(self);
 }
 
 static PyObject *TracedDict_items(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyDict_Items(((TracedDictObject *)self)->inner);
+    return PyDict_Items(self);
 }
 
 static PyObject *TracedDict_reduce(PyObject *self, PyObject *Py_UNUSED(args)) {
-    TracedDictObject *o = (TracedDictObject *)self;
     PyObject *builtins = PyImport_ImportModule("builtins");
     if (!builtins) return NULL;
     PyObject *dict_type = PyObject_GetAttrString(builtins, "dict");
     Py_DECREF(builtins);
     if (!dict_type) return NULL;
-    PyObject *items = PyDict_Items(o->inner);
+    PyObject *items = PyDict_Items(self);
     if (!items) { Py_DECREF(dict_type); return NULL; }
     PyObject *t_args = PyTuple_Pack(1, items);
     Py_DECREF(items);
@@ -286,7 +303,7 @@ static PyObject *TracedDict_reduce(PyObject *self, PyObject *Py_UNUSED(args)) {
 }
 
 static PyObject *TracedDict_copy(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyDict_Copy(((TracedDictObject *)self)->inner);
+    return PyDict_Copy(self);
 }
 
 static PyObject *TracedDict_get_wrapped(PyObject *self, void *closure) {
@@ -312,23 +329,12 @@ static PyGetSetDef TracedDict_getset[] = {
     {NULL}
 };
 
-static PySequenceMethods TracedDict_as_sequence = {
-    .sq_contains = TracedDict_contains,
-};
-
-static PyMappingMethods TracedDict_as_mapping = {
-    .mp_length = TracedDict_len,
-    .mp_subscript = TracedDict_subscript,
-    .mp_ass_subscript = TracedDict_ass_sub,
-};
-
 static PyType_Slot TracedDict_slots[] = {
     {Py_tp_init,      TracedDict_init},
     {Py_tp_dealloc,   TracedDict_dealloc},
     {Py_tp_traverse,  TracedDict_traverse},
     {Py_tp_clear,     TracedDict_clear_gc},
     {Py_tp_repr,      TracedDict_repr},
-    {Py_tp_iter,      TracedDict_iter},
     {Py_tp_methods,   TracedDict_methods},
     {Py_tp_getset,    TracedDict_getset},
     {Py_sq_contains,  TracedDict_contains},
@@ -346,7 +352,7 @@ static PyType_Spec TracedDict_spec = {
 };
 
 /* ======================================================================== */
-/* TracedList                                                                */
+/* TracedList  (subclasses list)                                             */
 /* ======================================================================== */
 
 PyTypeObject *TracedListType = NULL;
@@ -361,12 +367,18 @@ static int TracedList_init(PyObject *self, PyObject *args, PyObject *kw) {
             &source, &db, &trace_hook, &owner_idx, &attr))
         return -1;
 
-    Py_INCREF(source);
-    o->inner = source;
+    PyObject *init_args = PyTuple_Pack(1, source);
+    if (!init_args) return -1;
+    if (PyList_Type.tp_init(self, init_args, NULL) < 0) {
+        Py_DECREF(init_args);
+        return -1;
+    }
+    Py_DECREF(init_args);
+
     Py_INCREF(db); o->db = db;
     Py_INCREF(trace_hook); o->trace_hook = trace_hook;
 
-    Py_ssize_t n = PyList_GET_SIZE(o->inner);
+    Py_ssize_t n = PyList_GET_SIZE(self);
     o->arw_cap = n > 0 ? (size_t)n : 8;
     o->arws = calloc(o->arw_cap, sizeof(ArwEntry));
     o->arw_count = (size_t)n;
@@ -376,40 +388,34 @@ static int TracedList_init(PyObject *self, PyObject *args, PyObject *kw) {
 static void TracedList_dealloc(PyObject *self) {
     TracedListObject *o = (TracedListObject *)self;
     PyObject_GC_UnTrack(self);
-    Py_XDECREF(o->inner);
     Py_XDECREF(o->db);
     Py_XDECREF(o->trace_hook);
     free(o->arws);
-    Py_TYPE(self)->tp_free(self);
+    PyList_Type.tp_dealloc(self);
 }
 
 static int TracedList_traverse(PyObject *self, visitproc visit, void *arg) {
     TracedListObject *o = (TracedListObject *)self;
-    Py_VISIT(o->inner); Py_VISIT(o->db); Py_VISIT(o->trace_hook);
-    return 0;
+    Py_VISIT(o->db); Py_VISIT(o->trace_hook);
+    return PyList_Type.tp_traverse(self, visit, arg);
 }
 
 static int TracedList_clear_gc(PyObject *self) {
     TracedListObject *o = (TracedListObject *)self;
-    Py_CLEAR(o->inner); Py_CLEAR(o->db); Py_CLEAR(o->trace_hook);
-    return 0;
+    Py_CLEAR(o->db); Py_CLEAR(o->trace_hook);
+    return PyList_Type.tp_clear(self);
 }
 
 static Py_ssize_t TracedList_len(PyObject *self) {
-    return PyList_GET_SIZE(((TracedListObject *)self)->inner);
+    return PyList_GET_SIZE(self);
 }
 
 static PyObject *TracedList_repr(PyObject *self) {
-    TracedListObject *o = (TracedListObject *)self;
-    PyObject *r = PyObject_Repr(o->inner);
+    PyObject *r = PyList_Type.tp_repr(self);
     if (!r) return NULL;
     PyObject *result = PyUnicode_FromFormat("TracedList(%U)", r);
     Py_DECREF(r);
     return result;
-}
-
-static PyObject *TracedList_iter(PyObject *self) {
-    return PyObject_GetIter(((TracedListObject *)self)->inner);
 }
 
 static PyObject *TracedList_subscript(PyObject *self, PyObject *key) {
@@ -417,29 +423,50 @@ static PyObject *TracedList_subscript(PyObject *self, PyObject *key) {
     if (PyLong_Check(key)) {
         Py_ssize_t i = PyLong_AsSsize_t(key);
         if (i == -1 && PyErr_Occurred()) return NULL;
-        Py_ssize_t len = (Py_ssize_t)o->arw_count;
+        Py_ssize_t len = PyList_GET_SIZE(self);
         Py_ssize_t idx = i < 0 ? len + i : i;
-        PyObject *val = PyList_GetItem(o->inner, idx);
-        if (!val) return NULL;
-        if (idx >= 0 && idx < len)
+        if (idx < 0 || idx >= len) {
+            PyErr_SetString(PyExc_IndexError, "list index out of range");
+            return NULL;
+        }
+        PyObject *val = PyList_GET_ITEM(self, idx);
+        if ((size_t)idx < o->arw_count)
             emit_read(&o->arws[idx]);
         Py_INCREF(val);
         return val;
     }
-    return PyObject_CallMethod(o->inner, "__getitem__", "(O)", key);
+    return PyList_Type.tp_as_mapping->mp_subscript(self, key);
 }
 
 static int TracedList_ass_sub(PyObject *self, PyObject *key, PyObject *value) {
     TracedListObject *o = (TracedListObject *)self;
     if (!PyLong_Check(key))
-        return PyObject_SetItem(o->inner, key, value);
+        return PyList_Type.tp_as_mapping->mp_ass_subscript(self, key, value);
     Py_ssize_t i = PyLong_AsSsize_t(key);
     if (i == -1 && PyErr_Occurred()) return -1;
-    Py_ssize_t len = (Py_ssize_t)o->arw_count;
+    Py_ssize_t len = PyList_GET_SIZE(self);
     Py_ssize_t idx = i < 0 ? len + i : i;
-    if (PyList_SetItem(o->inner, idx, value) < 0) return -1;
-    Py_INCREF(value); /* SetItem steals a ref */
-    if (idx >= 0 && idx < len)
+    if (value == NULL) {
+        if (idx < 0 || idx >= len) {
+            PyErr_SetString(PyExc_IndexError,
+                            "list assignment index out of range");
+            return -1;
+        }
+        if ((size_t)idx < o->arw_count) {
+            memmove(&o->arws[idx], &o->arws[idx + 1],
+                    (o->arw_count - (size_t)idx - 1) * sizeof(ArwEntry));
+            o->arw_count--;
+        }
+        return PyList_SetSlice(self, idx, idx + 1, NULL);
+    }
+    if (idx < 0 || idx >= len) {
+        PyErr_SetString(PyExc_IndexError,
+                        "list assignment index out of range");
+        return -1;
+    }
+    Py_INCREF(value);
+    if (PyList_SetItem(self, idx, value) < 0) return -1;
+    if ((size_t)idx < o->arw_count)
         o->arws[idx] = caller_arw();
     return 0;
 }
@@ -453,7 +480,7 @@ static void tl_ensure_cap(TracedListObject *o, size_t need) {
 
 static PyObject *TracedList_append(PyObject *self, PyObject *value) {
     TracedListObject *o = (TracedListObject *)self;
-    if (PyList_Append(o->inner, value) < 0) return NULL;
+    if (PyList_Append(self, value) < 0) return NULL;
     tl_ensure_cap(o, o->arw_count + 1);
     o->arws[o->arw_count++] = caller_arw();
     Py_RETURN_NONE;
@@ -462,15 +489,27 @@ static PyObject *TracedList_append(PyObject *self, PyObject *value) {
 static PyObject *TracedList_extend(PyObject *self, PyObject *values) {
     TracedListObject *o = (TracedListObject *)self;
     ArwEntry arw = caller_arw();
-    size_t start = (size_t)PyList_GET_SIZE(o->inner);
-    PyObject *r = PyObject_CallMethod(o->inner, "extend", "(O)", values);
-    if (!r) return NULL;
-    Py_DECREF(r);
-    size_t new_len = (size_t)PyList_GET_SIZE(o->inner);
-    tl_ensure_cap(o, new_len);
-    for (size_t i = start; i < new_len; i++)
+    Py_ssize_t start = PyList_GET_SIZE(self);
+
+    PyObject *iter = PyObject_GetIter(values);
+    if (!iter) return NULL;
+    PyObject *item;
+    while ((item = PyIter_Next(iter)) != NULL) {
+        if (PyList_Append(self, item) < 0) {
+            Py_DECREF(item);
+            Py_DECREF(iter);
+            return NULL;
+        }
+        Py_DECREF(item);
+    }
+    Py_DECREF(iter);
+    if (PyErr_Occurred()) return NULL;
+
+    Py_ssize_t new_len = PyList_GET_SIZE(self);
+    tl_ensure_cap(o, (size_t)new_len);
+    for (Py_ssize_t i = start; i < new_len; i++)
         o->arws[i] = arw;
-    o->arw_count = new_len;
+    o->arw_count = (size_t)new_len;
     Py_RETURN_NONE;
 }
 
@@ -479,10 +518,10 @@ static PyObject *TracedList_insert(PyObject *self, PyObject *args) {
     Py_ssize_t index;
     PyObject *value;
     if (!PyArg_ParseTuple(args, "nO", &index, &value)) return NULL;
-    Py_ssize_t len = (Py_ssize_t)o->arw_count;
+    Py_ssize_t len = PyList_GET_SIZE(self);
     Py_ssize_t idx = index < 0 ? (len + 1 + index > 0 ? len + 1 + index : 0)
                                 : (index < len ? index : len);
-    if (PyList_Insert(o->inner, idx, value) < 0) return NULL;
+    if (PyList_Insert(self, idx, value) < 0) return NULL;
     tl_ensure_cap(o, o->arw_count + 1);
     memmove(&o->arws[idx + 1], &o->arws[idx],
             (o->arw_count - (size_t)idx) * sizeof(ArwEntry));
@@ -495,56 +534,73 @@ static PyObject *TracedList_pop(PyObject *self, PyObject *args) {
     TracedListObject *o = (TracedListObject *)self;
     Py_ssize_t index = -1;
     if (!PyArg_ParseTuple(args, "|n", &index)) return NULL;
-    Py_ssize_t len = (Py_ssize_t)o->arw_count;
+    Py_ssize_t len = PyList_GET_SIZE(self);
     Py_ssize_t idx = index < 0 ? len + index : index;
-    if (idx >= 0 && idx < len) {
+    if (idx < 0 || idx >= len) {
+        PyErr_SetString(PyExc_IndexError, "pop index out of range");
+        return NULL;
+    }
+    if ((size_t)idx < o->arw_count) {
         emit_read(&o->arws[idx]);
         memmove(&o->arws[idx], &o->arws[idx + 1],
                 (o->arw_count - (size_t)idx - 1) * sizeof(ArwEntry));
         o->arw_count--;
     }
-    return PyObject_CallMethod(o->inner, "pop", "n", index);
+    PyObject *val = PyList_GET_ITEM(self, idx);
+    Py_INCREF(val);
+    if (PyList_SetSlice(self, idx, idx + 1, NULL) < 0) {
+        Py_DECREF(val);
+        return NULL;
+    }
+    return val;
 }
 
 static PyObject *TracedList_remove(PyObject *self, PyObject *value) {
     TracedListObject *o = (TracedListObject *)self;
-    PyObject *idx_obj = PyObject_CallMethod(o->inner, "index", "(O)", value);
-    if (!idx_obj) return NULL;
-    Py_ssize_t idx = PyLong_AsSsize_t(idx_obj);
-    Py_DECREF(idx_obj);
-    if (idx >= 0 && (size_t)idx < o->arw_count) {
+    Py_ssize_t len = PyList_GET_SIZE(self);
+    Py_ssize_t idx = -1;
+    for (Py_ssize_t i = 0; i < len; i++) {
+        int cmp = PyObject_RichCompareBool(PyList_GET_ITEM(self, i), value, Py_EQ);
+        if (cmp < 0) return NULL;
+        if (cmp) { idx = i; break; }
+    }
+    if (idx < 0) {
+        PyErr_SetString(PyExc_ValueError, "list.remove(x): x not in list");
+        return NULL;
+    }
+    if ((size_t)idx < o->arw_count) {
         memmove(&o->arws[idx], &o->arws[idx + 1],
                 (o->arw_count - (size_t)idx - 1) * sizeof(ArwEntry));
         o->arw_count--;
     }
-    return PyObject_CallMethod(o->inner, "remove", "(O)", value);
+    if (PyList_SetSlice(self, idx, idx + 1, NULL) < 0) return NULL;
+    Py_RETURN_NONE;
 }
 
 static PyObject *TracedList_clear(PyObject *self, PyObject *Py_UNUSED(args)) {
     TracedListObject *o = (TracedListObject *)self;
-    PyObject *r = PyObject_CallMethod(o->inner, "clear", NULL);
-    if (!r) return NULL;
-    Py_DECREF(r);
+    if (PyList_SetSlice(self, 0, PyList_GET_SIZE(self), NULL) < 0) return NULL;
     o->arw_count = 0;
     Py_RETURN_NONE;
 }
 
 static PyObject *TracedList_copy(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyObject_CallMethod(((TracedListObject *)self)->inner, "copy", NULL);
+    return PyList_GetSlice(self, 0, PyList_GET_SIZE(self));
 }
 
 static PyObject *TracedList_add(PyObject *self, PyObject *other) {
-    return PyObject_CallMethod(((TracedListObject *)self)->inner, "__add__", "(O)", other);
+    if (PyList_Type.tp_as_sequence && PyList_Type.tp_as_sequence->sq_concat)
+        return PyList_Type.tp_as_sequence->sq_concat(self, other);
+    Py_RETURN_NOTIMPLEMENTED;
 }
 
 static PyObject *TracedList_reduce(PyObject *self, PyObject *Py_UNUSED(args)) {
-    TracedListObject *o = (TracedListObject *)self;
     PyObject *builtins = PyImport_ImportModule("builtins");
     if (!builtins) return NULL;
     PyObject *list_type = PyObject_GetAttrString(builtins, "list");
     Py_DECREF(builtins);
     if (!list_type) return NULL;
-    PyObject *t_args = PyTuple_Pack(1, o->inner);
+    PyObject *t_args = PyTuple_Pack(1, self);
     if (!t_args) { Py_DECREF(list_type); return NULL; }
     PyObject *result = PyTuple_Pack(2, list_type, t_args);
     Py_DECREF(list_type); Py_DECREF(t_args);
@@ -572,17 +628,12 @@ static PyGetSetDef TracedList_getset[] = {
     {NULL}
 };
 
-static PyNumberMethods TracedList_as_number = {
-    .nb_add = TracedList_add,
-};
-
 static PyType_Slot TracedList_slots[] = {
     {Py_tp_init,      TracedList_init},
     {Py_tp_dealloc,   TracedList_dealloc},
     {Py_tp_traverse,  TracedList_traverse},
     {Py_tp_clear,     TracedList_clear_gc},
     {Py_tp_repr,      TracedList_repr},
-    {Py_tp_iter,      TracedList_iter},
     {Py_tp_methods,   TracedList_methods},
     {Py_tp_getset,    TracedList_getset},
     {Py_sq_length,    TracedList_len},
@@ -601,7 +652,7 @@ static PyType_Spec TracedList_spec = {
 };
 
 /* ======================================================================== */
-/* TracedDeque                                                               */
+/* TracedDeque  (wrapper – deque's C struct is private)                      */
 /* ======================================================================== */
 
 PyTypeObject *TracedDequeType = NULL;
@@ -916,20 +967,37 @@ static PyObject *py_wrap_container(PyObject *self, PyObject *args) {
 }
 
 int containers_init(PyObject *module) {
-#define REGISTER(Name, spec, typevar) do { \
-    typevar = (PyTypeObject *)PyType_FromSpec(&spec); \
-    if (!typevar) return -1; \
-    if (PyModule_AddObject(module, #Name, (PyObject *)typevar) < 0) { \
-        Py_DECREF(typevar); \
-        return -1; \
-    } \
-} while(0)
+    PyObject *dict_bases = PyTuple_Pack(1, (PyObject *)&PyDict_Type);
+    if (!dict_bases) return -1;
+    TracedDictType = (PyTypeObject *)PyType_FromSpecWithBases(
+        &TracedDict_spec, dict_bases);
+    Py_DECREF(dict_bases);
+    if (!TracedDictType) return -1;
+    if (PyModule_AddObject(module, "TracedDict",
+                           (PyObject *)TracedDictType) < 0) {
+        Py_DECREF(TracedDictType);
+        return -1;
+    }
 
-    REGISTER(TracedDict,  TracedDict_spec,  TracedDictType);
-    REGISTER(TracedList,  TracedList_spec,   TracedListType);
-    REGISTER(TracedDeque, TracedDeque_spec,  TracedDequeType);
+    PyObject *list_bases = PyTuple_Pack(1, (PyObject *)&PyList_Type);
+    if (!list_bases) return -1;
+    TracedListType = (PyTypeObject *)PyType_FromSpecWithBases(
+        &TracedList_spec, list_bases);
+    Py_DECREF(list_bases);
+    if (!TracedListType) return -1;
+    if (PyModule_AddObject(module, "TracedList",
+                           (PyObject *)TracedListType) < 0) {
+        Py_DECREF(TracedListType);
+        return -1;
+    }
 
-#undef REGISTER
+    TracedDequeType = (PyTypeObject *)PyType_FromSpec(&TracedDeque_spec);
+    if (!TracedDequeType) return -1;
+    if (PyModule_AddObject(module, "TracedDeque",
+                           (PyObject *)TracedDequeType) < 0) {
+        Py_DECREF(TracedDequeType);
+        return -1;
+    }
 
     static PyMethodDef wrap_def = {
         "wrap_container", (PyCFunction)py_wrap_container, METH_VARARGS, NULL
