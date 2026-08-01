@@ -3,7 +3,6 @@
 
 #include <Python.h>
 #include <stdint.h>
-#include "hashmap.h"
 #include "records.h"
 
 typedef struct {
@@ -14,10 +13,9 @@ typedef struct {
 /* ---- TracedDict (subclasses dict) ---- */
 
 typedef struct {
-    PyDictObject dict;
-    UMap arws;            /* hash(key) -> heap ArwEntry* (cast to intptr_t) */
+    PyDictObject dict;    /* internal dict stores key -> (caller_id, lineno) tuples */
+    PyObject *source;     /* the actual dict being tracked */
     PyObject *db;
-    PyObject *trace_hook;
 } TracedDictObject;
 
 extern PyTypeObject *TracedDictType;
@@ -30,28 +28,16 @@ typedef struct {
     size_t arw_count;
     size_t arw_cap;
     PyObject *db;
-    PyObject *trace_hook;
 } TracedListObject;
 
 extern PyTypeObject *TracedListType;
 
-/* ---- TracedDeque (wrapper) ---- */
-
-typedef struct {
-    PyObject_HEAD
-    PyObject *inner;      /* deque */
-    ArwEntry *arws;
-    size_t arw_count;
-    size_t arw_cap;
-    PyObject *db;
-    PyObject *trace_hook;
-} TracedDequeObject;
+/* ---- TracedDeque (subclasses collections.deque) ---- */
+/* Extra fields accessed at runtime offset past deque's struct */
 
 extern PyTypeObject *TracedDequeType;
 
-PyObject *wrap_container_inner(PyObject *value, PyObject *db,
-                               PyObject *trace_hook, int obj_idx,
-                               const char *attr_name);
+PyObject *wrap_container_inner(PyObject *value, PyObject *db, int obj_idx);
 
 int containers_init(PyObject *module);
 

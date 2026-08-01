@@ -4,9 +4,7 @@
 #include <string.h>
 
 /* forward declaration from containers.c */
-extern PyObject *wrap_container_inner(PyObject *value, PyObject *db,
-                                      PyObject *trace_hook, int obj_idx,
-                                      const char *attr_name);
+extern PyObject *wrap_container_inner(PyObject *value, PyObject *db, int obj_idx);
 
 /* forward declaration from hook.c — access frame stack peek */
 extern PyObject *py_current_record(PyObject *self, PyObject *args);
@@ -162,7 +160,7 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
 
             if ((is_dict || is_list || is_deque) && !is_wrapped) {
                 PyObject *wrapped = wrap_container_inner(
-                    value, ts->db, ts->trace_hook, (int)obj_idx, name_str);
+                    value, ts->db, (int)obj_idx);
                 if (wrapped) {
                     PyObject *b2 = PyImport_ImportModule("builtins");
                     PyObject *ot2 = b2 ? PyObject_GetAttrString(b2, "object") : NULL;

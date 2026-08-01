@@ -36,128 +36,124 @@ static void emit_read(const ArwEntry *arw) {
     Py_DECREF(rec);
 }
 
-static uint64_t pyobj_keyhash(PyObject *key) {
-    Py_hash_t h = PyObject_Hash(key);
-    if (h == -1 && PyErr_Occurred()) {
-        PyErr_Clear();
-        return (uint64_t)(uintptr_t)key;
-    }
-    return (uint64_t)h;
-}
-
 /* ======================================================================== */
 /* TracedDict  (subclasses dict)                                             */
 /* ======================================================================== */
 
 PyTypeObject *TracedDictType = NULL;
 
+static PyObject *make_arw_tuple(ArwEntry e) {
+    return Py_BuildValue("Ki", e.caller_id, e.call_lineno);
+}
+
+static ArwEntry arw_from_tuple(PyObject *t) {
+    ArwEntry e = {0, 0};
+    if (t && PyTuple_CheckExact(t) && PyTuple_GET_SIZE(t) == 2) {
+        e.caller_id = PyLong_AsUnsignedLongLong(PyTuple_GET_ITEM(t, 0));
+        e.call_lineno = (int32_t)PyLong_AsLong(PyTuple_GET_ITEM(t, 1));
+        if (PyErr_Occurred()) { PyErr_Clear(); e.caller_id = 0; e.call_lineno = 0; }
+    }
+    return e;
+}
+
+static void td_emit_read(PyObject *self, PyObject *key) {
+    PyObject *arw_obj = PyDict_GetItemWithError(self, key);
+    if (arw_obj) {
+        ArwEntry e = arw_from_tuple(arw_obj);
+        emit_read(&e);
+    } else if (PyErr_Occurred()) {
+        PyErr_Clear();
+    }
+}
+
 static int TracedDict_init(PyObject *self, PyObject *args, PyObject *kw) {
     TracedDictObject *o = (TracedDictObject *)self;
-    static char *kwlist[] = {"source", "db", "trace_hook", "owner_idx", "attr", NULL};
-    PyObject *source, *db, *trace_hook;
+    static char *kwlist[] = {"source", "db", "owner_idx", NULL};
+    PyObject *source, *db;
     int owner_idx;
-    const char *attr;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "OOOis", kwlist,
-            &source, &db, &trace_hook, &owner_idx, &attr))
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "OOi", kwlist,
+            &source, &db, &owner_idx))
         return -1;
 
-    if (PyDict_Update(self, source) < 0) return -1;
-
+    Py_INCREF(source); o->source = source;
     Py_INCREF(db); o->db = db;
-    Py_INCREF(trace_hook); o->trace_hook = trace_hook;
-    umap_init(&o->arws, 32);
 
-    PyObject *keys = PyDict_Keys(self);
+    PyObject *zero_arw = make_arw_tuple((ArwEntry){0, 0});
+    if (!zero_arw) return -1;
+    PyObject *keys = PyDict_Keys(source);
     if (keys) {
         Py_ssize_t n = PyList_GET_SIZE(keys);
-        for (Py_ssize_t i = 0; i < n; i++) {
-            uint64_t h = pyobj_keyhash(PyList_GET_ITEM(keys, i));
-            ArwEntry *e = calloc(1, sizeof(ArwEntry));
-            umap_set(&o->arws, (uintptr_t)h, (intptr_t)e);
-        }
+        for (Py_ssize_t i = 0; i < n; i++)
+            PyDict_SetItem(self, PyList_GET_ITEM(keys, i), zero_arw);
         Py_DECREF(keys);
     }
+    Py_DECREF(zero_arw);
     return 0;
 }
 
 static void TracedDict_dealloc(PyObject *self) {
     TracedDictObject *o = (TracedDictObject *)self;
     PyObject_GC_UnTrack(self);
+    Py_XDECREF(o->source);
     Py_XDECREF(o->db);
-    Py_XDECREF(o->trace_hook);
-    if (o->arws.entries) {
-        for (size_t i = 0; i < o->arws.capacity; i++)
-            if (o->arws.entries[i].occupied && o->arws.entries[i].value)
-                free((void *)o->arws.entries[i].value);
-    }
-    umap_free(&o->arws);
     PyDict_Type.tp_dealloc(self);
 }
 
 static int TracedDict_traverse(PyObject *self, visitproc visit, void *arg) {
     TracedDictObject *o = (TracedDictObject *)self;
-    Py_VISIT(o->db); Py_VISIT(o->trace_hook);
+    Py_VISIT(o->source); Py_VISIT(o->db);
     return PyDict_Type.tp_traverse(self, visit, arg);
 }
 
 static int TracedDict_clear_gc(PyObject *self) {
     TracedDictObject *o = (TracedDictObject *)self;
-    Py_CLEAR(o->db); Py_CLEAR(o->trace_hook);
+    Py_CLEAR(o->source); Py_CLEAR(o->db);
     return PyDict_Type.tp_clear(self);
 }
 
 static Py_ssize_t TracedDict_len(PyObject *self) {
-    return PyDict_Size(self);
+    TracedDictObject *o = (TracedDictObject *)self;
+    return PyDict_Size(o->source);
 }
 
 static int TracedDict_ass_sub(PyObject *self, PyObject *key, PyObject *value) {
     TracedDictObject *o = (TracedDictObject *)self;
     if (value == NULL) {
-        if (PyDict_DelItem(self, key) < 0) return -1;
-        uint64_t h = pyobj_keyhash(key);
-        intptr_t old;
-        if (umap_get(&o->arws, (uintptr_t)h, &old)) {
-            free((void *)old);
-            umap_set(&o->arws, (uintptr_t)h, (intptr_t)0);
-        }
+        if (PyDict_DelItem(o->source, key) < 0) return -1;
+        PyDict_DelItem(self, key);
+        PyErr_Clear();
         return 0;
     }
-    if (PyDict_SetItem(self, key, value) < 0) return -1;
-    uint64_t h = pyobj_keyhash(key);
-    intptr_t old;
-    ArwEntry *e;
-    if (umap_get(&o->arws, (uintptr_t)h, &old)) {
-        e = (ArwEntry *)old;
-    } else {
-        e = malloc(sizeof(ArwEntry));
-        umap_set(&o->arws, (uintptr_t)h, (intptr_t)e);
+    if (PyDict_SetItem(o->source, key, value) < 0) return -1;
+    PyObject *arw = make_arw_tuple(caller_arw());
+    if (arw) {
+        PyDict_SetItem(self, key, arw);
+        Py_DECREF(arw);
     }
-    *e = caller_arw();
     return 0;
 }
 
 static PyObject *TracedDict_subscript(PyObject *self, PyObject *key) {
     TracedDictObject *o = (TracedDictObject *)self;
-    PyObject *val = PyDict_GetItemWithError(self, key);
+    PyObject *val = PyDict_GetItemWithError(o->source, key);
     if (!val) {
         if (!PyErr_Occurred())
             PyErr_SetObject(PyExc_KeyError, key);
         return NULL;
     }
-    uint64_t h = pyobj_keyhash(key);
-    intptr_t arw_ptr;
-    if (umap_get(&o->arws, (uintptr_t)h, &arw_ptr))
-        emit_read((ArwEntry *)arw_ptr);
+    td_emit_read(self, key);
     Py_INCREF(val);
     return val;
 }
 
 static int TracedDict_contains(PyObject *self, PyObject *key) {
-    return PyDict_Contains(self, key);
+    TracedDictObject *o = (TracedDictObject *)self;
+    return PyDict_Contains(o->source, key);
 }
 
 static PyObject *TracedDict_repr(PyObject *self) {
-    PyObject *r = PyDict_Type.tp_repr(self);
+    TracedDictObject *o = (TracedDictObject *)self;
+    PyObject *r = PyObject_Repr(o->source);
     if (!r) return NULL;
     PyObject *result = PyUnicode_FromFormat("TracedDict(%U)", r);
     Py_DECREF(r);
@@ -168,12 +164,9 @@ static PyObject *TracedDict_get(PyObject *self, PyObject *args) {
     TracedDictObject *o = (TracedDictObject *)self;
     PyObject *key, *def = Py_None;
     if (!PyArg_ParseTuple(args, "O|O", &key, &def)) return NULL;
-    PyObject *val = PyDict_GetItemWithError(self, key);
+    PyObject *val = PyDict_GetItemWithError(o->source, key);
     if (val) {
-        uint64_t h = pyobj_keyhash(key);
-        intptr_t arw_ptr;
-        if (umap_get(&o->arws, (uintptr_t)h, &arw_ptr))
-            emit_read((ArwEntry *)arw_ptr);
+        td_emit_read(self, key);
         Py_INCREF(val);
         return val;
     }
@@ -187,18 +180,13 @@ static PyObject *TracedDict_pop(PyObject *self, PyObject *args) {
     PyObject *key;
     PyObject *def = NULL;
     if (!PyArg_ParseTuple(args, "O|O", &key, &def)) return NULL;
-    uint64_t h = pyobj_keyhash(key);
-    intptr_t arw_ptr;
-    if (umap_get(&o->arws, (uintptr_t)h, &arw_ptr))
-        emit_read((ArwEntry *)arw_ptr);
-    PyObject *val = PyDict_GetItemWithError(self, key);
+    td_emit_read(self, key);
+    PyObject *val = PyDict_GetItemWithError(o->source, key);
     if (val) {
         Py_INCREF(val);
+        PyDict_DelItem(o->source, key);
         PyDict_DelItem(self, key);
-        if (umap_get(&o->arws, (uintptr_t)h, &arw_ptr)) {
-            free((void *)arw_ptr);
-            umap_set(&o->arws, (uintptr_t)h, (intptr_t)0);
-        }
+        PyErr_Clear();
         return val;
     }
     if (PyErr_Occurred()) return NULL;
@@ -212,48 +200,41 @@ static PyObject *TracedDict_pop(PyObject *self, PyObject *args) {
 
 static PyObject *TracedDict_update(PyObject *self, PyObject *args, PyObject *kw) {
     TracedDictObject *o = (TracedDictObject *)self;
-    PyObject *name = PyUnicode_InternFromString("update");
-    PyObject *descr = _PyType_Lookup(&PyDict_Type, name);
-    Py_DECREF(name);
-    if (!descr) {
-        PyErr_SetString(PyExc_RuntimeError, "dict.update not found");
-        return NULL;
+    PyObject *other = NULL;
+    if (PyTuple_GET_SIZE(args) > 0)
+        other = PyTuple_GET_ITEM(args, 0);
+    if (other && PyDict_Check(other)) {
+        if (PyDict_Merge(o->source, other, 1) < 0) return NULL;
+    } else if (other) {
+        if (PyDict_MergeFromSeq2(o->source, other, 1) < 0) return NULL;
     }
-    descrgetfunc f = Py_TYPE(descr)->tp_descr_get;
-    PyObject *bound;
-    if (f) {
-        bound = f(descr, self, (PyObject *)Py_TYPE(self));
-        if (!bound) return NULL;
-    } else {
-        Py_INCREF(descr);
-        bound = descr;
+    if (kw && PyDict_Size(kw) > 0) {
+        if (PyDict_Merge(o->source, kw, 1) < 0) return NULL;
     }
-    PyObject *result = PyObject_Call(bound, args, kw);
-    Py_DECREF(bound);
-    if (!result) return NULL;
-    Py_DECREF(result);
 
     ArwEntry arw = caller_arw();
-    PyObject *keys = PyDict_Keys(self);
-    if (keys) {
-        Py_ssize_t n = PyList_GET_SIZE(keys);
-        for (Py_ssize_t i = 0; i < n; i++) {
-            uint64_t h = pyobj_keyhash(PyList_GET_ITEM(keys, i));
-            if (!umap_contains(&o->arws, (uintptr_t)h)) {
-                ArwEntry *e = malloc(sizeof(ArwEntry));
-                *e = arw;
-                umap_set(&o->arws, (uintptr_t)h, (intptr_t)e);
+    PyObject *arw_obj = make_arw_tuple(arw);
+    if (arw_obj) {
+        PyObject *keys = PyDict_Keys(o->source);
+        if (keys) {
+            Py_ssize_t n = PyList_GET_SIZE(keys);
+            for (Py_ssize_t i = 0; i < n; i++) {
+                PyObject *k = PyList_GET_ITEM(keys, i);
+                if (!PyDict_Contains(self, k))
+                    PyDict_SetItem(self, k, arw_obj);
             }
+            Py_DECREF(keys);
         }
-        Py_DECREF(keys);
+        Py_DECREF(arw_obj);
     }
     Py_RETURN_NONE;
 }
 
 static PyObject *TracedDict_setdefault(PyObject *self, PyObject *args) {
+    TracedDictObject *o = (TracedDictObject *)self;
     PyObject *key, *def = Py_None;
     if (!PyArg_ParseTuple(args, "O|O", &key, &def)) return NULL;
-    if (PyDict_Contains(self, key))
+    if (PyDict_Contains(o->source, key))
         return TracedDict_subscript(self, key);
     TracedDict_ass_sub(self, key, def);
     Py_INCREF(def);
@@ -262,36 +243,34 @@ static PyObject *TracedDict_setdefault(PyObject *self, PyObject *args) {
 
 static PyObject *TracedDict_clear(PyObject *self, PyObject *Py_UNUSED(args)) {
     TracedDictObject *o = (TracedDictObject *)self;
+    PyDict_Clear(o->source);
     PyDict_Clear(self);
-    if (o->arws.entries) {
-        for (size_t i = 0; i < o->arws.capacity; i++)
-            if (o->arws.entries[i].occupied && o->arws.entries[i].value)
-                free((void *)o->arws.entries[i].value);
-    }
-    umap_free(&o->arws);
-    umap_init(&o->arws, 32);
     Py_RETURN_NONE;
 }
 
 static PyObject *TracedDict_keys(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyDict_Keys(self);
+    TracedDictObject *o = (TracedDictObject *)self;
+    return PyDict_Keys(o->source);
 }
 
 static PyObject *TracedDict_values(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyDict_Values(self);
+    TracedDictObject *o = (TracedDictObject *)self;
+    return PyDict_Values(o->source);
 }
 
 static PyObject *TracedDict_items(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyDict_Items(self);
+    TracedDictObject *o = (TracedDictObject *)self;
+    return PyDict_Items(o->source);
 }
 
 static PyObject *TracedDict_reduce(PyObject *self, PyObject *Py_UNUSED(args)) {
+    TracedDictObject *o = (TracedDictObject *)self;
     PyObject *builtins = PyImport_ImportModule("builtins");
     if (!builtins) return NULL;
     PyObject *dict_type = PyObject_GetAttrString(builtins, "dict");
     Py_DECREF(builtins);
     if (!dict_type) return NULL;
-    PyObject *items = PyDict_Items(self);
+    PyObject *items = PyDict_Items(o->source);
     if (!items) { Py_DECREF(dict_type); return NULL; }
     PyObject *t_args = PyTuple_Pack(1, items);
     Py_DECREF(items);
@@ -303,7 +282,8 @@ static PyObject *TracedDict_reduce(PyObject *self, PyObject *Py_UNUSED(args)) {
 }
 
 static PyObject *TracedDict_copy(PyObject *self, PyObject *Py_UNUSED(args)) {
-    return PyDict_Copy(self);
+    TracedDictObject *o = (TracedDictObject *)self;
+    return PyDict_Copy(o->source);
 }
 
 static PyObject *TracedDict_get_wrapped(PyObject *self, void *closure) {
@@ -359,12 +339,11 @@ PyTypeObject *TracedListType = NULL;
 
 static int TracedList_init(PyObject *self, PyObject *args, PyObject *kw) {
     TracedListObject *o = (TracedListObject *)self;
-    static char *kwlist[] = {"source", "db", "trace_hook", "owner_idx", "attr", NULL};
-    PyObject *source, *db, *trace_hook;
+    static char *kwlist[] = {"source", "db", "owner_idx", NULL};
+    PyObject *source, *db;
     int owner_idx;
-    const char *attr;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "OOOis", kwlist,
-            &source, &db, &trace_hook, &owner_idx, &attr))
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "OOi", kwlist,
+            &source, &db, &owner_idx))
         return -1;
 
     PyObject *init_args = PyTuple_Pack(1, source);
@@ -376,7 +355,6 @@ static int TracedList_init(PyObject *self, PyObject *args, PyObject *kw) {
     Py_DECREF(init_args);
 
     Py_INCREF(db); o->db = db;
-    Py_INCREF(trace_hook); o->trace_hook = trace_hook;
 
     Py_ssize_t n = PyList_GET_SIZE(self);
     o->arw_cap = n > 0 ? (size_t)n : 8;
@@ -389,20 +367,19 @@ static void TracedList_dealloc(PyObject *self) {
     TracedListObject *o = (TracedListObject *)self;
     PyObject_GC_UnTrack(self);
     Py_XDECREF(o->db);
-    Py_XDECREF(o->trace_hook);
     free(o->arws);
     PyList_Type.tp_dealloc(self);
 }
 
 static int TracedList_traverse(PyObject *self, visitproc visit, void *arg) {
     TracedListObject *o = (TracedListObject *)self;
-    Py_VISIT(o->db); Py_VISIT(o->trace_hook);
+    Py_VISIT(o->db);
     return PyList_Type.tp_traverse(self, visit, arg);
 }
 
 static int TracedList_clear_gc(PyObject *self) {
     TracedListObject *o = (TracedListObject *)self;
-    Py_CLEAR(o->db); Py_CLEAR(o->trace_hook);
+    Py_CLEAR(o->db);
     return PyList_Type.tp_clear(self);
 }
 
@@ -652,71 +629,98 @@ static PyType_Spec TracedList_spec = {
 };
 
 /* ======================================================================== */
-/* TracedDeque  (wrapper – deque's C struct is private)                      */
+/* TracedDeque  (subclasses collections.deque)                               */
 /* ======================================================================== */
 
 PyTypeObject *TracedDequeType = NULL;
+static PyTypeObject *deque_type_obj = NULL;
+static Py_ssize_t deque_basicsize = 0;
+
+typedef struct {
+    ArwEntry *arws;
+    size_t arw_count;
+    size_t arw_cap;
+    PyObject *db;
+} TracedDequeExtra;
+
+static inline TracedDequeExtra *td_extra(PyObject *self) {
+    return (TracedDequeExtra *)((char *)self + deque_basicsize);
+}
+
+static PyObject *deque_base_call(PyObject *self, const char *method, PyObject *arg) {
+    PyObject *meth = PyObject_GetAttrString((PyObject *)deque_type_obj, method);
+    if (!meth) return NULL;
+    PyObject *result;
+    if (arg)
+        result = PyObject_CallFunctionObjArgs(meth, self, arg, NULL);
+    else
+        result = PyObject_CallFunctionObjArgs(meth, self, NULL);
+    Py_DECREF(meth);
+    return result;
+}
+
+static Py_ssize_t base_deque_len(PyObject *self) {
+    return deque_type_obj->tp_as_sequence->sq_length(self);
+}
 
 static int TracedDeque_init(PyObject *self, PyObject *args, PyObject *kw) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    static char *kwlist[] = {"source", "db", "trace_hook", "owner_idx", "attr", NULL};
-    PyObject *source, *db, *trace_hook;
+    TracedDequeExtra *x = td_extra(self);
+    static char *kwlist[] = {"source", "db", "owner_idx", NULL};
+    PyObject *source, *db;
     int owner_idx;
-    const char *attr;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "OOOis", kwlist,
-            &source, &db, &trace_hook, &owner_idx, &attr))
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "OOi", kwlist,
+            &source, &db, &owner_idx))
         return -1;
 
-    Py_INCREF(source);
-    o->inner = source;
+    PyObject *base_args = PyTuple_Pack(1, source);
+    if (!base_args) return -1;
+    int rc = deque_type_obj->tp_init(self, base_args, NULL);
+    Py_DECREF(base_args);
+    if (rc < 0) return -1;
 
-    Py_INCREF(db); o->db = db;
-    Py_INCREF(trace_hook); o->trace_hook = trace_hook;
+    Py_INCREF(db); x->db = db;
 
-    Py_ssize_t n = PyObject_Length(o->inner);
+    Py_ssize_t n = base_deque_len(self);
     if (n < 0) { PyErr_Clear(); n = 0; }
-    o->arw_cap = n > 0 ? (size_t)n : 8;
-    o->arws = calloc(o->arw_cap, sizeof(ArwEntry));
-    o->arw_count = (size_t)n;
+    x->arw_cap = n > 0 ? (size_t)n : 8;
+    x->arws = calloc(x->arw_cap, sizeof(ArwEntry));
+    x->arw_count = (size_t)n;
     return 0;
 }
 
 static void TracedDeque_dealloc(PyObject *self) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
+    TracedDequeExtra *x = td_extra(self);
     PyObject_GC_UnTrack(self);
-    Py_XDECREF(o->inner);
-    Py_XDECREF(o->db);
-    Py_XDECREF(o->trace_hook);
-    free(o->arws);
-    Py_TYPE(self)->tp_free(self);
+    Py_XDECREF(x->db);
+    free(x->arws);
+    deque_type_obj->tp_dealloc(self);
 }
 
 static int TracedDeque_traverse(PyObject *self, visitproc visit, void *arg) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    Py_VISIT(o->inner); Py_VISIT(o->db); Py_VISIT(o->trace_hook);
-    return 0;
+    TracedDequeExtra *x = td_extra(self);
+    Py_VISIT(x->db);
+    return deque_type_obj->tp_traverse(self, visit, arg);
 }
 
 static int TracedDeque_clear_gc(PyObject *self) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    Py_CLEAR(o->inner); Py_CLEAR(o->db); Py_CLEAR(o->trace_hook);
-    return 0;
+    TracedDequeExtra *x = td_extra(self);
+    Py_CLEAR(x->db);
+    return deque_type_obj->tp_clear(self);
 }
 
-static void td_ensure_cap(TracedDequeObject *o, size_t need) {
-    if (need > o->arw_cap) {
-        o->arw_cap = need * 2;
-        o->arws = realloc(o->arws, o->arw_cap * sizeof(ArwEntry));
+static void tdx_ensure_cap(TracedDequeExtra *x, size_t need) {
+    if (need > x->arw_cap) {
+        x->arw_cap = need * 2;
+        x->arws = realloc(x->arws, x->arw_cap * sizeof(ArwEntry));
     }
 }
 
 static Py_ssize_t TracedDeque_len(PyObject *self) {
-    return PyObject_Length(((TracedDequeObject *)self)->inner);
+    return base_deque_len(self);
 }
 
 static PyObject *TracedDeque_repr(PyObject *self) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    PyObject *r = PyObject_Repr(o->inner);
+    PyObject *r = deque_type_obj->tp_repr(self);
     if (!r) return NULL;
     PyObject *result = PyUnicode_FromFormat("TracedDeque(%U)", r);
     Py_DECREF(r);
@@ -724,20 +728,20 @@ static PyObject *TracedDeque_repr(PyObject *self) {
 }
 
 static PyObject *TracedDeque_iter(PyObject *self) {
-    return PyObject_GetIter(((TracedDequeObject *)self)->inner);
+    return deque_type_obj->tp_iter(self);
 }
 
 static PyObject *TracedDeque_subscript(PyObject *self, PyObject *key) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    PyObject *result = PyObject_GetItem(o->inner, key);
+    TracedDequeExtra *x = td_extra(self);
+    PyObject *result = deque_type_obj->tp_as_mapping->mp_subscript(self, key);
     if (!result) return NULL;
     if (PyLong_Check(key)) {
         Py_ssize_t i = PyLong_AsSsize_t(key);
         if (!(i == -1 && PyErr_Occurred())) {
-            Py_ssize_t len = (Py_ssize_t)o->arw_count;
+            Py_ssize_t len = (Py_ssize_t)x->arw_count;
             Py_ssize_t idx = i < 0 ? len + i : i;
             if (idx >= 0 && idx < len)
-                emit_read(&o->arws[idx]);
+                emit_read(&x->arws[idx]);
         } else {
             PyErr_Clear();
         }
@@ -746,17 +750,18 @@ static PyObject *TracedDeque_subscript(PyObject *self, PyObject *key) {
 }
 
 static int TracedDeque_ass_sub(PyObject *self, PyObject *key, PyObject *value) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
+    TracedDequeExtra *x = td_extra(self);
     if (value == NULL)
-        return PyObject_DelItem(o->inner, key);
-    if (PyObject_SetItem(o->inner, key, value) < 0) return -1;
+        return deque_type_obj->tp_as_mapping->mp_ass_subscript(self, key, NULL);
+    if (deque_type_obj->tp_as_mapping->mp_ass_subscript(self, key, value) < 0)
+        return -1;
     if (PyLong_Check(key)) {
         Py_ssize_t i = PyLong_AsSsize_t(key);
         if (!(i == -1 && PyErr_Occurred())) {
-            Py_ssize_t len = (Py_ssize_t)o->arw_count;
+            Py_ssize_t len = (Py_ssize_t)x->arw_count;
             Py_ssize_t idx = i < 0 ? len + i : i;
             if (idx >= 0 && idx < len)
-                o->arws[idx] = caller_arw();
+                x->arws[idx] = caller_arw();
         } else {
             PyErr_Clear();
         }
@@ -765,118 +770,112 @@ static int TracedDeque_ass_sub(PyObject *self, PyObject *key, PyObject *value) {
 }
 
 static PyObject *TracedDeque_append(PyObject *self, PyObject *value) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    PyObject *r = PyObject_CallMethod(o->inner, "append", "(O)", value);
+    TracedDequeExtra *x = td_extra(self);
+    PyObject *r = deque_base_call(self, "append", value);
     if (!r) return NULL;
     Py_DECREF(r);
-    td_ensure_cap(o, o->arw_count + 1);
-    o->arws[o->arw_count++] = caller_arw();
+    tdx_ensure_cap(x, x->arw_count + 1);
+    x->arws[x->arw_count++] = caller_arw();
     Py_RETURN_NONE;
 }
 
 static PyObject *TracedDeque_appendleft(PyObject *self, PyObject *value) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    PyObject *r = PyObject_CallMethod(o->inner, "appendleft", "(O)", value);
+    TracedDequeExtra *x = td_extra(self);
+    PyObject *r = deque_base_call(self, "appendleft", value);
     if (!r) return NULL;
     Py_DECREF(r);
-    td_ensure_cap(o, o->arw_count + 1);
-    memmove(&o->arws[1], &o->arws[0], o->arw_count * sizeof(ArwEntry));
-    o->arws[0] = caller_arw();
-    o->arw_count++;
+    tdx_ensure_cap(x, x->arw_count + 1);
+    memmove(&x->arws[1], &x->arws[0], x->arw_count * sizeof(ArwEntry));
+    x->arws[0] = caller_arw();
+    x->arw_count++;
     Py_RETURN_NONE;
 }
 
 static PyObject *TracedDeque_extend(PyObject *self, PyObject *values) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
+    TracedDequeExtra *x = td_extra(self);
     ArwEntry arw = caller_arw();
-    Py_ssize_t start = PyObject_Length(o->inner);
-    PyObject *r = PyObject_CallMethod(o->inner, "extend", "(O)", values);
+    Py_ssize_t start = base_deque_len(self);
+    PyObject *r = deque_base_call(self, "extend", values);
     if (!r) return NULL;
     Py_DECREF(r);
-    Py_ssize_t new_len = PyObject_Length(o->inner);
-    td_ensure_cap(o, (size_t)new_len);
+    Py_ssize_t new_len = base_deque_len(self);
+    tdx_ensure_cap(x, (size_t)new_len);
     for (Py_ssize_t i = start; i < new_len; i++)
-        o->arws[i] = arw;
-    o->arw_count = (size_t)new_len;
+        x->arws[i] = arw;
+    x->arw_count = (size_t)new_len;
     Py_RETURN_NONE;
 }
 
 static PyObject *TracedDeque_extendleft(PyObject *self, PyObject *values) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
+    TracedDequeExtra *x = td_extra(self);
     ArwEntry arw = caller_arw();
-    Py_ssize_t start = PyObject_Length(o->inner);
-    PyObject *r = PyObject_CallMethod(o->inner, "extendleft", "(O)", values);
+    Py_ssize_t start = base_deque_len(self);
+    PyObject *r = deque_base_call(self, "extendleft", values);
     if (!r) return NULL;
     Py_DECREF(r);
-    Py_ssize_t new_len = PyObject_Length(o->inner);
+    Py_ssize_t new_len = base_deque_len(self);
     Py_ssize_t added = new_len - start;
-    td_ensure_cap(o, (size_t)new_len);
-    memmove(&o->arws[added], &o->arws[0], o->arw_count * sizeof(ArwEntry));
+    tdx_ensure_cap(x, (size_t)new_len);
+    memmove(&x->arws[added], &x->arws[0], x->arw_count * sizeof(ArwEntry));
     for (Py_ssize_t i = 0; i < added; i++)
-        o->arws[i] = arw;
-    o->arw_count = (size_t)new_len;
+        x->arws[i] = arw;
+    x->arw_count = (size_t)new_len;
     Py_RETURN_NONE;
 }
 
 static PyObject *TracedDeque_pop(PyObject *self, PyObject *Py_UNUSED(args)) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    if (o->arw_count > 0) {
-        emit_read(&o->arws[o->arw_count - 1]);
-        o->arw_count--;
+    TracedDequeExtra *x = td_extra(self);
+    if (x->arw_count > 0) {
+        emit_read(&x->arws[x->arw_count - 1]);
+        x->arw_count--;
     }
-    return PyObject_CallMethod(o->inner, "pop", NULL);
+    return deque_base_call(self, "pop", NULL);
 }
 
 static PyObject *TracedDeque_popleft(PyObject *self, PyObject *Py_UNUSED(args)) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    if (o->arw_count > 0) {
-        emit_read(&o->arws[0]);
-        memmove(&o->arws[0], &o->arws[1], (o->arw_count - 1) * sizeof(ArwEntry));
-        o->arw_count--;
+    TracedDequeExtra *x = td_extra(self);
+    if (x->arw_count > 0) {
+        emit_read(&x->arws[0]);
+        memmove(&x->arws[0], &x->arws[1], (x->arw_count - 1) * sizeof(ArwEntry));
+        x->arw_count--;
     }
-    return PyObject_CallMethod(o->inner, "popleft", NULL);
+    return deque_base_call(self, "popleft", NULL);
 }
 
 static PyObject *TracedDeque_remove(PyObject *self, PyObject *value) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    PyObject *idx_obj = PyObject_CallMethod(o->inner, "index", "(O)", value);
+    TracedDequeExtra *x = td_extra(self);
+    PyObject *idx_obj = deque_base_call(self, "index", value);
     if (idx_obj) {
         Py_ssize_t idx = PyLong_AsSsize_t(idx_obj);
         Py_DECREF(idx_obj);
-        if (idx >= 0 && (size_t)idx < o->arw_count) {
-            memmove(&o->arws[idx], &o->arws[idx + 1],
-                    (o->arw_count - (size_t)idx - 1) * sizeof(ArwEntry));
-            o->arw_count--;
+        if (idx >= 0 && (size_t)idx < x->arw_count) {
+            memmove(&x->arws[idx], &x->arws[idx + 1],
+                    (x->arw_count - (size_t)idx - 1) * sizeof(ArwEntry));
+            x->arw_count--;
         }
     } else {
         PyErr_Clear();
     }
-    return PyObject_CallMethod(o->inner, "remove", "(O)", value);
+    return deque_base_call(self, "remove", value);
 }
 
 static PyObject *TracedDeque_clear(PyObject *self, PyObject *Py_UNUSED(args)) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    PyObject *r = PyObject_CallMethod(o->inner, "clear", NULL);
+    TracedDequeExtra *x = td_extra(self);
+    PyObject *r = deque_base_call(self, "clear", NULL);
     if (!r) return NULL;
     Py_DECREF(r);
-    o->arw_count = 0;
+    x->arw_count = 0;
     Py_RETURN_NONE;
 }
 
 static PyObject *TracedDeque_reduce(PyObject *self, PyObject *Py_UNUSED(args)) {
-    TracedDequeObject *o = (TracedDequeObject *)self;
-    PyObject *collections = PyImport_ImportModule("collections");
-    if (!collections) return NULL;
-    PyObject *deque_type = PyObject_GetAttrString(collections, "deque");
-    Py_DECREF(collections);
-    if (!deque_type) return NULL;
-    PyObject *copy = PyObject_CallMethod(o->inner, "copy", NULL);
-    if (!copy) { Py_DECREF(deque_type); return NULL; }
+    PyObject *copy = deque_base_call(self, "copy", NULL);
+    if (!copy) return NULL;
     PyObject *t_args = PyTuple_Pack(1, copy);
     Py_DECREF(copy);
-    if (!t_args) { Py_DECREF(deque_type); return NULL; }
-    PyObject *result = PyTuple_Pack(2, deque_type, t_args);
-    Py_DECREF(deque_type); Py_DECREF(t_args);
+    if (!t_args) return NULL;
+    PyObject *result = PyTuple_Pack(2, (PyObject *)deque_type_obj, t_args);
+    Py_DECREF(t_args);
     return result;
 }
 
@@ -919,7 +918,7 @@ static PyType_Slot TracedDeque_slots[] = {
 
 static PyType_Spec TracedDeque_spec = {
     .name = "tracer._tracer.TracedDeque",
-    .basicsize = sizeof(TracedDequeObject),
+    .basicsize = 0, /* filled at init */
     .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
     .slots = TracedDeque_slots,
 };
@@ -928,18 +927,16 @@ static PyType_Spec TracedDeque_spec = {
 /* wrap_container                                                            */
 /* ======================================================================== */
 
-PyObject *wrap_container_inner(PyObject *value, PyObject *db,
-                               PyObject *trace_hook, int obj_idx,
-                               const char *attr_name) {
+PyObject *wrap_container_inner(PyObject *value, PyObject *db, int obj_idx) {
     if (PyDict_Check(value)) {
         return PyObject_CallFunction(
-            (PyObject *)TracedDictType, "OOOis",
-            value, db, trace_hook, obj_idx, attr_name);
+            (PyObject *)TracedDictType, "OOi",
+            value, db, obj_idx);
     }
     if (PyList_Check(value)) {
         return PyObject_CallFunction(
-            (PyObject *)TracedListType, "OOOis",
-            value, db, trace_hook, obj_idx, attr_name);
+            (PyObject *)TracedListType, "OOi",
+            value, db, obj_idx);
     }
     PyObject *qn = PyObject_GetAttrString((PyObject *)Py_TYPE(value), "__qualname__");
     if (qn) {
@@ -947,8 +944,8 @@ PyObject *wrap_container_inner(PyObject *value, PyObject *db,
         Py_DECREF(qn);
         if (qns && strcmp(qns, "deque") == 0) {
             return PyObject_CallFunction(
-                (PyObject *)TracedDequeType, "OOOis",
-                value, db, trace_hook, obj_idx, attr_name);
+                (PyObject *)TracedDequeType, "OOi",
+                value, db, obj_idx);
         }
     } else {
         PyErr_Clear();
@@ -957,13 +954,11 @@ PyObject *wrap_container_inner(PyObject *value, PyObject *db,
 }
 
 static PyObject *py_wrap_container(PyObject *self, PyObject *args) {
-    PyObject *value, *db, *trace_hook;
+    PyObject *value, *db;
     int owner_idx;
-    const char *attr;
-    if (!PyArg_ParseTuple(args, "OOOis", &value, &db, &trace_hook,
-                          &owner_idx, &attr))
+    if (!PyArg_ParseTuple(args, "OOi", &value, &db, &owner_idx))
         return NULL;
-    return wrap_container_inner(value, db, trace_hook, owner_idx, attr);
+    return wrap_container_inner(value, db, owner_idx);
 }
 
 int containers_init(PyObject *module) {
@@ -991,7 +986,19 @@ int containers_init(PyObject *module) {
         return -1;
     }
 
-    TracedDequeType = (PyTypeObject *)PyType_FromSpec(&TracedDeque_spec);
+    PyObject *collections = PyImport_ImportModule("collections");
+    if (!collections) return -1;
+    deque_type_obj = (PyTypeObject *)PyObject_GetAttrString(collections, "deque");
+    Py_DECREF(collections);
+    if (!deque_type_obj) return -1;
+    deque_basicsize = deque_type_obj->tp_basicsize;
+    TracedDeque_spec.basicsize = (int)(deque_basicsize + sizeof(TracedDequeExtra));
+
+    PyObject *deque_bases = PyTuple_Pack(1, (PyObject *)deque_type_obj);
+    if (!deque_bases) return -1;
+    TracedDequeType = (PyTypeObject *)PyType_FromSpecWithBases(
+        &TracedDeque_spec, deque_bases);
+    Py_DECREF(deque_bases);
     if (!TracedDequeType) return -1;
     if (PyModule_AddObject(module, "TracedDeque",
                            (PyObject *)TracedDequeType) < 0) {
