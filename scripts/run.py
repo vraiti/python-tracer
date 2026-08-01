@@ -19,6 +19,13 @@ MODELS = {
     "Qwen/Qwen3-Omni-30B-A3B-Instruct": {
         "args": ["--quantization", "fp8"],
     },
+    "tiny-random/Qwen-Image": {
+        "args": [],
+        "query": {
+            "url": "http://localhost:8000/v1/images/generations",
+            "body": {"prompt": "a red panda", "size": "256x256"},
+        },
+    },
 }
 
 _configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
