@@ -472,12 +472,12 @@ def _check_machine_id(c: Any) -> None:
     try:
         row = c.execute("SELECT machine_id FROM machine").fetchone()
     except Exception:
-        return
-    if row is None:
-        return
+        print("Error: trace has no machine table. Re-collect the trace.", file=sys.stderr)
+        sys.exit(1)
+    if row is None or not row[0]:
+        print("Error: trace has no machine_id. Re-collect the trace.", file=sys.stderr)
+        sys.exit(1)
     trace_id = row[0]
-    if not trace_id:
-        return
     local_id = ""
     try:
         with open("/etc/machine-id") as f:
@@ -678,9 +678,39 @@ def postprocess(db_path: str) -> None:
             seen_owners.add(key)
             deduped_owners.append(row)
 
+    # --- break cycles: order by creation time, remove last -> first edge ---
+    n_broken = 0
+    owner_map: dict[tuple[int, int], tuple[int, int, int, str]] = {}
+    for row in deduped_owners:
+        owner_map[(row[0], row[1])] = row
+
+    visited_global: set[tuple[int, int]] = set()
+    for key in list(owner_map):
+        if key in visited_global:
+            continue
+        path: list[tuple[int, int]] = []
+        path_set: set[tuple[int, int]] = set()
+        node = key
+        while node not in path_set and node in owner_map:
+            if node in visited_global:
+                break
+            path.append(node)
+            path_set.add(node)
+            row = owner_map[node]
+            node = (row[0], row[2])
+        else:
+            if node in path_set:
+                cycle_start = path.index(node)
+                cycle = path[cycle_start:]
+                cycle.sort(key=lambda k: obj_init_call.get(k, 0))
+                last = cycle[-1]
+                del owner_map[last]
+                n_broken += 1
+        visited_global.update(path_set)
+
     c.executemany(
         "INSERT INTO default_owner VALUES (?, ?, ?, ?)",
-        deduped_owners,
+        owner_map.values(),
     )
 
     conn.commit()
@@ -689,7 +719,7 @@ def postprocess(db_path: str) -> None:
     print(
         f"Postprocessed {db_path}: {n_resolved} calls resolved, {n_skipped} skipped, "
         f"{len(merged)} dataflow edges, {len(all_executed)} executed lines, "
-        f"{len(deduped_owners)} default owners",
+        f"{len(owner_map)} default owners, {n_broken} cycles broken",
         file=sys.stderr,
     )
 
