@@ -4,5 +4,7 @@ modules:
   - janus
 classes:
   - starlette.datastructures.State
+  - fastapi.FastAPI
+  - fastapi.APIRouter
 taint-functions:
   - _dummy_run
