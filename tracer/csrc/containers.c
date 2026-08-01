@@ -61,8 +61,8 @@ static int TracedDict_init(PyObject *self, PyObject *args, PyObject *kw) {
             &source, &db, &trace_hook, &owner_idx, &attr))
         return -1;
 
-    o->inner = PyDict_Copy(source);
-    if (!o->inner) return -1;
+    Py_INCREF(source);
+    o->inner = source;
     Py_INCREF(db); o->db = db;
     Py_INCREF(trace_hook); o->trace_hook = trace_hook;
     umap_init(&o->arws, 32);
@@ -361,8 +361,8 @@ static int TracedList_init(PyObject *self, PyObject *args, PyObject *kw) {
             &source, &db, &trace_hook, &owner_idx, &attr))
         return -1;
 
-    o->inner = PyObject_CallMethod(source, "copy", NULL);
-    if (!o->inner) return -1;
+    Py_INCREF(source);
+    o->inner = source;
     Py_INCREF(db); o->db = db;
     Py_INCREF(trace_hook); o->trace_hook = trace_hook;
 
@@ -616,14 +616,8 @@ static int TracedDeque_init(PyObject *self, PyObject *args, PyObject *kw) {
             &source, &db, &trace_hook, &owner_idx, &attr))
         return -1;
 
-    PyObject *collections = PyImport_ImportModule("collections");
-    if (!collections) return -1;
-    PyObject *deque_type = PyObject_GetAttrString(collections, "deque");
-    Py_DECREF(collections);
-    if (!deque_type) return -1;
-    o->inner = PyObject_CallFunctionObjArgs(deque_type, source, NULL);
-    Py_DECREF(deque_type);
-    if (!o->inner) return -1;
+    Py_INCREF(source);
+    o->inner = source;
 
     Py_INCREF(db); o->db = db;
     Py_INCREF(trace_hook); o->trace_hook = trace_hook;
