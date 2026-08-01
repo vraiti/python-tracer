@@ -2,5 +2,5 @@ target
 traces
 **/*.so
 **/__pycache__
-**/.stamp
+*.stamp
 *.egg-info
