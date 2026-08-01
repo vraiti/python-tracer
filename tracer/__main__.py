@@ -276,6 +276,7 @@ def main() -> None:
                         break
                     except sqlite3.Error as e:
                         try:
+                            conn.rollback()
                             conn.execute("DETACH DATABASE child")
                         except Exception:
                             pass
