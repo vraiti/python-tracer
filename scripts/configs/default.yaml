@@ -2,6 +2,8 @@ modules:
   - vllm
   - vllm_omni
   - janus
+  - fastapi
+  - starlette
 classes:
   - starlette.datastructures.State
   - fastapi.FastAPI
