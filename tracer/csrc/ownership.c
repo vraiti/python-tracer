@@ -56,6 +56,9 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
                                           PyObject *self_obj,
                                           PyObject *name,
                                           PyObject *value) {
+    if (!g_state.enabled)
+        return PyObject_CallFunctionObjArgs(ts->original, self_obj, name, value, NULL);
+
     const char *name_str = PyUnicode_AsUTF8(name);
     if (!name_str) return NULL;
 
@@ -331,6 +334,8 @@ static PyObject *traced_getattr_call_impl(TracedGetattrObject *tg,
                                           PyObject *name) {
     PyObject *value = PyObject_CallFunctionObjArgs(tg->original, self_obj, name, NULL);
     if (!value) return NULL;
+
+    if (!g_state.enabled) return value;
 
     const char *name_str = PyUnicode_AsUTF8(name);
     if (!name_str) return value;
