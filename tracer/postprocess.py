@@ -468,9 +468,36 @@ def resolve_ipc_edges(
 # Main postprocessor
 # ---------------------------------------------------------------------------
 
+def _check_machine_id(c: Any) -> None:
+    try:
+        row = c.execute("SELECT machine_id FROM machine").fetchone()
+    except Exception:
+        return
+    if row is None:
+        return
+    trace_id = row[0]
+    if not trace_id:
+        return
+    local_id = ""
+    try:
+        with open("/etc/machine-id") as f:
+            local_id = f.read().strip()
+    except OSError:
+        return
+    if local_id != trace_id:
+        print(
+            f"Error: trace was collected on machine {trace_id}, "
+            f"but this machine is {local_id}. "
+            f"Postprocess must run on the same machine as the trace.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def postprocess(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
+    _check_machine_id(c)
 
     func_map: dict[int, str] = {}
     for fid, ref in c.execute("SELECT function_id, ref FROM functions"):

@@ -43,6 +43,7 @@ def serialize(db: Database, output: str) -> None:
 
     c.executescript("""
         CREATE TABLE meta (pid INTEGER);
+        CREATE TABLE machine (machine_id TEXT NOT NULL);
         CREATE TABLE functions (function_id INTEGER PRIMARY KEY, ref TEXT NOT NULL);
         CREATE TABLE calls (
             pid INTEGER NOT NULL,
@@ -81,6 +82,13 @@ def serialize(db: Database, output: str) -> None:
     """)
 
     c.execute("INSERT INTO meta VALUES (?)", (os.getpid(),))
+    machine_id = ""
+    try:
+        with open("/etc/machine-id") as f:
+            machine_id = f.read().strip()
+    except OSError:
+        pass
+    c.execute("INSERT INTO machine VALUES (?)", (machine_id,))
 
     func_map = {v: k for k, v in get_func_map().items()}
     c.executemany(
