@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sqlite3
 import sys
 import threading
@@ -218,12 +219,39 @@ def main() -> None:
     with open(script) as f:
         code = compile(f.read(), script, "exec")
 
+    _uninstalled = False
+
+    _orig_signal = signal.signal
+    def _wrap_signal(signum: int, handler: Any) -> Any:
+        if signum == signal.SIGTERM and callable(handler):
+            real_handler = handler
+            def _wrapper(s: int, f: Any) -> Any:
+                nonlocal _uninstalled
+                if not _uninstalled:
+                    uninstall()
+                    _uninstalled = True
+                return real_handler(s, f)
+            return _orig_signal(signum, _wrapper)
+        return _orig_signal(signum, handler)
+    signal.signal = _wrap_signal  # type: ignore
+
+    def _default_sigterm(signum: int, frame: Any) -> None:
+        nonlocal _uninstalled
+        if not _uninstalled:
+            uninstall()
+            _uninstalled = True
+        raise SystemExit(0)
+    _orig_signal(signal.SIGTERM, _default_sigterm)
+
     try:
         exec(code, {"__name__": "__main__", "__file__": script})
     except SystemExit:
         pass
     finally:
-        uninstall()
+        if not _uninstalled:
+            uninstall()
+            _uninstalled = True
+        signal.signal = _orig_signal  # type: ignore
         proc_hook.uninstall()
         proc_hook.join_children()
         serialize(db, args.output)
