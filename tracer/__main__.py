@@ -274,7 +274,7 @@ def main() -> None:
                         conn.execute("INSERT INTO ipc SELECT * FROM child.ipc")
                         conn.execute("DETACH DATABASE child")
                         break
-                    except sqlite3.OperationalError:
+                    except sqlite3.Error as e:
                         try:
                             conn.execute("DETACH DATABASE child")
                         except Exception:
@@ -282,7 +282,7 @@ def main() -> None:
                         if attempt < 9:
                             _time.sleep(1)
                         else:
-                            print(f"Failed to merge {child_db} after 10 attempts", file=sys.stderr)
+                            print(f"Failed to merge {child_db} after 10 attempts: {e}", file=sys.stderr)
             conn.commit()
             conn.close()
 
