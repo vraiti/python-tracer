@@ -2,3 +2,6 @@
 	path = cpython
 	url = https://github.com/vraiti/cpython.git
 	branch = main
+[submodule "pyo3"]
+	path = pyo3
+	url = git@github.com:vraiti/pyo3.git
