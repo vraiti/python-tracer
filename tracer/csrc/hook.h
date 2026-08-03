@@ -7,12 +7,25 @@
 #include "records.h"
 #include "filter.h"
 
+#define Py_IS_PRIMITIVE(obj) ( \
+    PyLong_Check(obj) || PyFloat_Check(obj) || PyBool_Check(obj) || \
+    PyUnicode_Check(obj) || PyBytes_Check(obj) || \
+    (obj) == Py_None || (obj) == Py_True || (obj) == Py_False \
+)
+
 /* Bitset for control-flow lines */
 typedef struct {
     uint64_t *words;
     int32_t max_line;
     size_t n_words;
 } Bitset;
+
+/* Per-object trace data stored in PyTrace_Hashtable */
+typedef struct {
+    uint64_t id;
+    ARWMap attrs;
+    char type;
+} ObjectTraceData;
 
 /* Per-frame entry on the trace stack */
 typedef struct {

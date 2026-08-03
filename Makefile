@@ -12,8 +12,8 @@ CPYTHON_ROOT := $(CPYTHON_DIR)
 EXT_SUFFIX := $(shell $(CPYTHON_BIN) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 
 TRACER_SO := tracer/_tracer$(EXT_SUFFIX)
-TRACER_SRCS := $(wildcard tracer/csrc/*.c)
-TRACER_HDRS := $(wildcard tracer/csrc/*.h)
+TRACER_SRCS := $(wildcard tracer/csrc/*.c) $(wildcard tracer/csrc/containers/*.c)
+TRACER_HDRS := $(wildcard tracer/csrc/*.h) $(wildcard tracer/csrc/containers/*.h)
 
 .PHONY: all cpython install clean ext
 
@@ -22,7 +22,7 @@ all: ext
 ext: $(TRACER_SO)
 
 $(TRACER_SO): $(TRACER_SRCS) $(TRACER_HDRS)
-	$(CC) -O2 -shared -fPIC \
+	$(CC) -Og -g -shared -fPIC \
 		-I$(CPYTHON_INC) \
 		-I$(CPYTHON_INTERNAL_INC) \
 		-I$(CPYTHON_ROOT) \

@@ -29,9 +29,16 @@ for ((i=0; i<${#args[@]}; i++)); do
     esac
 done
 
-# Version queries must return real output (CMake parses this)
+# Version queries: hardcoded output so no real CUDA toolkit is needed
 if [[ $version -eq 1 ]]; then
-    exec "$REAL_NVCC" --version
+    cat <<'EOF'
+nvcc: NVIDIA (R) Cuda compiler driver
+Copyright (c) 2005-2025 NVIDIA Corporation
+Built on Wed_Mar_12_19:20:56_PDT_2025
+Cuda compilation tools, release 12.8, V12.8.93
+Build cuda_12.8.r12.8/compiler.35583870_0
+EOF
+    exit 0
 fi
 
 # Dryrun: return success

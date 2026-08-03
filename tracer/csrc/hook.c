@@ -1,4 +1,5 @@
 #include "hook.h"
+#include "containers/containers.h"
 #include "internal/pycore_frame.h"
 #include <string.h>
 #include <stdlib.h>
@@ -8,6 +9,36 @@
 extern void ownership_patch_class(PyObject *ownership, PyObject *cls);
 
 TraceState g_state = {0};
+
+static void tracer_extra_free_hook(void *ptr) {
+    ObjectTraceData *data = (ObjectTraceData *)ptr;
+    switch (data->type) {
+    case CONTAINER_DICT: {
+        DictTraceData *td = (DictTraceData *)ptr;
+        arwdict_free(&td->arws);
+        break;
+    }
+    case CONTAINER_LIST: {
+        ListTraceData *td = (ListTraceData *)ptr;
+        arwlist_free(&td->arws);
+        break;
+    }
+    case CONTAINER_DEQUE: {
+        DequeTraceData *td = (DequeTraceData *)ptr;
+        arwdeque_free(&td->arws);
+        break;
+    }
+    case CONTAINER_SET: {
+        SetTraceData *td = (SetTraceData *)ptr;
+        arwset_free(&td->arws);
+        break;
+    }
+    default:
+        break;
+    }
+    ARWMap_free(&data->attrs);
+    free(ptr);
+}
 
 /* ---- bitset helpers ---- */
 
@@ -97,10 +128,10 @@ static int check_scope(uintptr_t filename_ptr, const char *filename) {
 
 static int32_t get_or_assign_function_id(const char *ref_str) {
     void *val;
-    if (smap_get(&g_state.func_to_id, ref_str, &val))
+    if (SMap_get(&g_state.func_to_id, ref_str, &val))
         return (int32_t)(intptr_t)val;
     int32_t id = g_state.next_func_id++;
-    smap_set(&g_state.func_to_id, ref_str, (void *)(intptr_t)id);
+    SMap_set(&g_state.func_to_id, ref_str, (void *)(intptr_t)id);
     return id;
 }
 
@@ -150,7 +181,7 @@ static int is_tracked_class(PyObject *self_obj, PyCodeObject *code) {
         if (mod_str && qual_str) {
             char buf[512];
             snprintf(buf, sizeof(buf), "%s.%s", mod_str, qual_str);
-            result = smap_contains(&pf->tracked_classes, buf);
+            result = SMap_contains(&pf->tracked_classes, buf);
         }
     }
     Py_XDECREF(module);
@@ -187,10 +218,11 @@ static void handle_init(PyObject *self_obj, PyCodeObject *code, uint64_t call_id
     }
     Py_DECREF(obj_rec);
 
-    PyObject *idx_obj = PyLong_FromSsize_t(obj_idx);
-    PyObject_GenericSetAttr(self_obj,
-        PyUnicode_InternFromString("__tr_idx"), idx_obj);
-    Py_DECREF(idx_obj);
+    ObjectTraceData *trace_data = malloc(sizeof(ObjectTraceData));
+    trace_data->id = (uint64_t)obj_idx;
+    ARWMap_init(&trace_data->attrs, 16);
+    trace_data->type = CONTAINER_NONE;
+    PyObject_SetExtra(self_obj, trace_data);
 
     if (g_state.ownership)
         ownership_patch_class(g_state.ownership, cls);
@@ -209,7 +241,7 @@ static void push_traced_frame(uint64_t call_id, PyObject *record,
     entry.branch_cap = 0;
 
     void *bits_ptr;
-    if (smap_get(&g_state.cf_bits, ref_str, &bits_ptr)) {
+    if (SMap_get(&g_state.cf_bits, ref_str, &bits_ptr)) {
         Bitset *src = (Bitset *)bits_ptr;
         entry.cf_bits.max_line = src->max_line;
         entry.cf_bits.n_words = src->n_words;
@@ -230,10 +262,10 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
     /* taint propagation */
     PyFrameObject *back = PyFrame_GetBack(frame_obj);
     if (back) {
-        uint64_t caller_cid = ((PyFrameObject *)back)->call_id;
+        uint64_t caller_cid = back->f_frame->call_id;
         Py_DECREF((PyObject *)back);
         if (caller_cid == UINT64_MAX) {
-            ((PyFrameObject *)py_frame)->call_id = UINT64_MAX;
+            ((PyFrameObject *)py_frame)->f_frame->call_id = UINT64_MAX;
             ((PyFrameObject *)py_frame)->f_trace_lines = 0;
             return 0;
         }
@@ -262,7 +294,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
         if (qualname) {
             for (Py_ssize_t i = 0; i < g_state.taint_count; i++) {
                 if (strstr(qualname, g_state.taint_patterns[i])) {
-                    ((PyFrameObject *)py_frame)->call_id = UINT64_MAX;
+                    ((PyFrameObject *)py_frame)->f_frame->call_id = UINT64_MAX;
                     ((PyFrameObject *)py_frame)->f_trace_lines = 0;
                     Py_DECREF(code);
                     return 0;
@@ -272,7 +304,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
     }
 
     if (!in_scope) {
-        ((PyFrameObject *)py_frame)->call_id = 0;
+        ((PyFrameObject *)py_frame)->f_frame->call_id = 0;
         ((PyFrameObject *)py_frame)->f_trace_lines = 0;
 
         /* check for __init__ on tracked class */
@@ -287,7 +319,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
                 int call_lineno = 0;
                 PyFrameObject *back2 = PyFrame_GetBack(frame_obj);
                 if (back2) {
-                    caller_id = ((PyFrameObject *)back2)->call_id;
+                    caller_id = back2->f_frame->call_id;
                     call_lineno = PyFrame_GetLineNumber(back2);
                     Py_DECREF((PyObject *)back2);
                 }
@@ -299,7 +331,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
                     snprintf(ref_buf, sizeof(ref_buf), "%s:%s", filename, qn);
                     int32_t function_id = get_or_assign_function_id(ref_buf);
 
-                    ((PyFrameObject *)py_frame)->call_id = call_id;
+                    ((PyFrameObject *)py_frame)->f_frame->call_id = call_id;
                     ((PyFrameObject *)py_frame)->f_trace_lines = 1;
 
                     DatabaseObject *db = (DatabaseObject *)g_state.db;
@@ -328,13 +360,13 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
 
     /* in-scope call */
     uint64_t call_id = g_state.next_call_id++;
-    ((PyFrameObject *)py_frame)->call_id = call_id;
+    ((PyFrameObject *)py_frame)->f_frame->call_id = call_id;
 
     uint64_t caller_id = 0;
     int call_lineno = 0;
     PyFrameObject *back3 = PyFrame_GetBack(frame_obj);
     if (back3) {
-        caller_id = ((PyFrameObject *)back3)->call_id;
+        caller_id = back3->f_frame->call_id;
         call_lineno = PyFrame_GetLineNumber(back3);
         Py_DECREF((PyObject *)back3);
     }
@@ -405,7 +437,7 @@ static int handle_line(PyObject *py_frame, PyFrameObject *frame_obj) {
 }
 
 static int handle_return(PyObject *py_frame, PyFrameObject *frame_obj) {
-    uint64_t cid = ((PyFrameObject *)py_frame)->call_id;
+    uint64_t cid = ((PyFrameObject *)py_frame)->f_frame->call_id;
     if (cid == 0 || cid == UINT64_MAX) return 0;
 
     while (g_state.frame_count > 0) {
@@ -522,6 +554,7 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
     g_state.frame_cap = 0;
     g_state.enabled = 1;
 
+    PyObject_SetExtraFreeHook(tracer_extra_free_hook);
     PyEval_SetTrace((Py_tracefunc)trace_func, g_state.hook_obj);
     Py_RETURN_NONE;
 }
@@ -542,7 +575,7 @@ static PyObject *py_uninstall(PyObject *self, PyObject *Py_UNUSED(args)) {
 }
 
 static PyObject *py_get_call_id(PyObject *self, PyObject *frame) {
-    uint64_t cid = ((PyFrameObject *)frame)->call_id;
+    uint64_t cid = ((PyFrameObject *)frame)->f_frame->call_id;
     return PyLong_FromUnsignedLongLong(cid);
 }
 
@@ -551,7 +584,7 @@ static PyObject *py_set_call_id(PyObject *self, PyObject *args) {
     uint64_t cid;
     if (!PyArg_ParseTuple(args, "OK", &frame, &cid))
         return NULL;
-    ((PyFrameObject *)frame)->call_id = cid;
+    ((PyFrameObject *)frame)->f_frame->call_id = cid;
     Py_RETURN_NONE;
 }
 
@@ -568,7 +601,7 @@ static PyObject *py_load_ast_data(PyObject *self, PyObject *args) {
         return NULL;
 
     /* clear old data */
-    smap_free(&g_state.func_to_id);
+    SMap_free(&g_state.func_to_id);
     /* free bitsets in cf_bits before freeing the map */
     if (g_state.cf_bits.entries) {
         for (size_t i = 0; i < g_state.cf_bits.capacity; i++) {
@@ -578,10 +611,10 @@ static PyObject *py_load_ast_data(PyObject *self, PyObject *args) {
             }
         }
     }
-    smap_free(&g_state.cf_bits);
+    SMap_free(&g_state.cf_bits);
 
-    smap_init(&g_state.func_to_id, 512);
-    smap_init(&g_state.cf_bits, 256);
+    SMap_init(&g_state.func_to_id, 512);
+    SMap_init(&g_state.cf_bits, 256);
     g_state.next_func_id = 0;
 
     /* load func_map */
@@ -591,7 +624,7 @@ static PyObject *py_load_ast_data(PyObject *self, PyObject *args) {
         const char *ref_str = PyUnicode_AsUTF8(key);
         long id = PyLong_AsLong(value);
         if (ref_str && !(id == -1 && PyErr_Occurred())) {
-            smap_set(&g_state.func_to_id, ref_str, (void *)(intptr_t)(int32_t)id);
+            SMap_set(&g_state.func_to_id, ref_str, (void *)(intptr_t)(int32_t)id);
             if ((int32_t)id >= g_state.next_func_id)
                 g_state.next_func_id = (int32_t)id + 1;
         } else {
@@ -608,7 +641,7 @@ static PyObject *py_load_ast_data(PyObject *self, PyObject *args) {
         if (bs.max_line >= 0) {
             Bitset *heap_bs = malloc(sizeof(Bitset));
             *heap_bs = bs;
-            smap_set(&g_state.cf_bits, ref_str, heap_bs);
+            SMap_set(&g_state.cf_bits, ref_str, heap_bs);
         }
     }
 

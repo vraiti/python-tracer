@@ -9,4 +9,4 @@ else
 fi
 git push -f
 
-ssh wsl 'cd /home/vraiti/python-tracer && git fetch origin && git reset --hard origin/main'
+ssh wsl 'cd /home/vraiti/python-tracer && git fetch origin && git reset --hard origin/main && git submodule update --init --recursive'

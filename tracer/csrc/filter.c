@@ -17,7 +17,7 @@ static int PathFilter_init(PyObject *self, PyObject *args, PyObject *kw) {
     o->prefixes = NULL;
     o->prefix_count = 0;
     umap_init(&o->scope_cache, 256);
-    smap_init(&o->tracked_classes, 64);
+    SMap_init(&o->tracked_classes, 64);
 
     if (prefixes_obj != Py_None && prefixes_obj != NULL) {
         if (!PyList_Check(prefixes_obj)) {
@@ -100,7 +100,7 @@ static int PathFilter_init(PyObject *self, PyObject *args, PyObject *kw) {
                 end--;
             *end = '\0';
             if (*start && *start != '#')
-                smap_set(&o->tracked_classes, start, NULL);
+                SMap_set(&o->tracked_classes, start, NULL);
         }
         fclose(f);
     }
@@ -114,7 +114,7 @@ static int PathFilter_init(PyObject *self, PyObject *args, PyObject *kw) {
         for (Py_ssize_t i = 0; i < n; i++) {
             const char *s = PyUnicode_AsUTF8(PyList_GET_ITEM(tracked_classes_obj, i));
             if (!s) return -1;
-            smap_set(&o->tracked_classes, s, NULL);
+            SMap_set(&o->tracked_classes, s, NULL);
         }
     }
 
@@ -129,7 +129,7 @@ static void PathFilter_dealloc(PyObject *self) {
         free(o->prefixes);
     }
     umap_free(&o->scope_cache);
-    smap_free(&o->tracked_classes);
+    SMap_free(&o->tracked_classes);
     Py_TYPE(self)->tp_free(self);
 }
 
@@ -174,7 +174,7 @@ static PyObject *PathFilter_is_tracked_class(PyObject *self, PyObject *arg) {
     if (mod_str && qual_str) {
         char buf[512];
         snprintf(buf, sizeof(buf), "%s.%s", mod_str, qual_str);
-        found = smap_contains(&o->tracked_classes, buf);
+        found = SMap_contains(&o->tracked_classes, buf);
     }
     Py_DECREF(module);
     Py_DECREF(qualname);

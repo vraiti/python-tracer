@@ -3,7 +3,7 @@
 #include "filter.h"
 #include "hook.h"
 #include "ownership.h"
-#include "containers.h"
+#include "containers/containers.h"
 
 static struct PyModuleDef tracer_module = {
     PyModuleDef_HEAD_INIT,

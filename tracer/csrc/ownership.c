@@ -1,10 +1,11 @@
 #include "ownership.h"
 #include "hook.h"
+#include "containers/containers.h"
 #include "internal/pycore_frame.h"
 #include <string.h>
 
 /* forward declaration from containers.c */
-extern PyObject *wrap_container_inner(PyObject *value, PyObject *db, int obj_idx);
+extern PyObject *wrap_container(PyObject *value, PyObject *db, int obj_idx);
 
 /* forward declaration from hook.c — access frame stack peek */
 extern PyObject *py_current_record(PyObject *self, PyObject *args);
@@ -61,130 +62,77 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
     const char *name_str = PyUnicode_AsUTF8(name);
     if (!name_str) return NULL;
 
-    /* bypass for internal attrs */
-    if (strncmp(name_str, "__tr_", 5) == 0 || strncmp(name_str, "__arw_", 6) == 0) {
-        PyObject *builtins = PyImport_ImportModule("builtins");
-        if (!builtins) return NULL;
-        PyObject *object = PyObject_GetAttrString(builtins, "object");
-        Py_DECREF(builtins);
-        if (!object) return NULL;
-        PyObject *r = PyObject_CallMethod(object, "__setattr__", "OOO",
-                                          self_obj, name, value);
-        Py_DECREF(object);
-        if (!r) return NULL;
-        Py_DECREF(r);
-        Py_RETURN_NONE;
-    }
-
     /* call original setattr */
     PyObject *res = PyObject_CallFunctionObjArgs(ts->original, self_obj, name, value, NULL);
     if (!res) return NULL;
     Py_DECREF(res);
 
-    /* record the write */
+    /* look up trace data for this object */
+    ObjectTraceData *trace_data = (ObjectTraceData *)PyObject_GetExtra(self_obj);
+    if (!trace_data) Py_RETURN_NONE;
+
+    /* record the write in the ARWMap */
     PyFrameObject *frame_ptr = PyEval_GetFrame();
-    if (!frame_ptr) Py_RETURN_NONE;
-
-    uint64_t caller_id = ((PyFrameObject *)frame_ptr)->call_id;
-    int call_lineno = PyFrame_GetLineNumber(frame_ptr);
-
-    PyObject *arw = PyObject_CallFunction((PyObject *)AttrRecordWriteType,
-                                          "Ki", caller_id, call_lineno);
-    if (!arw) { PyErr_Clear(); Py_RETURN_NONE; }
-
-    /* store arw on the instance as __arw_<name> */
-    char arw_key[256];
-    snprintf(arw_key, sizeof(arw_key), "__arw_%s", name_str);
-    PyObject *builtins = PyImport_ImportModule("builtins");
-    PyObject *object_type = builtins ? PyObject_GetAttrString(builtins, "object") : NULL;
-    Py_XDECREF(builtins);
-    if (object_type) {
-        PyObject *sa = PyObject_GetAttrString(object_type, "__setattr__");
-        if (sa) {
-            PyObject *arw_name = PyUnicode_FromString(arw_key);
-            PyObject *r2 = PyObject_CallFunctionObjArgs(sa, self_obj, arw_name, arw, NULL);
-            if (!r2) PyErr_Clear();
-            Py_XDECREF(r2);
-            Py_DECREF(arw_name);
-            Py_DECREF(sa);
-        }
-        Py_DECREF(object_type);
+    if (frame_ptr) {
+        uint64_t caller_id = frame_ptr->f_frame->call_id;
+        int call_lineno = PyFrame_GetLineNumber(frame_ptr);
+        ARW arw = {caller_id, call_lineno};
+        ARWMap_set(&trace_data->attrs, name_str, arw);
     }
-    Py_DECREF(arw);
+
+    if (Py_IS_PRIMITIVE(value))
+        Py_RETURN_NONE;
 
     /* track member relationships */
-    PyObject *self_tr_idx = PyObject_GetAttrString(self_obj, "__tr_idx");
-    if (self_tr_idx) {
-        long obj_idx = PyLong_AsLong(self_tr_idx);
-        Py_DECREF(self_tr_idx);
-        if (!(obj_idx == -1 && PyErr_Occurred())) {
-            PyObject *val_tr_idx = PyObject_GetAttrString(value, "__tr_idx");
-            if (val_tr_idx) {
-                long val_idx = PyLong_AsLong(val_tr_idx);
-                Py_DECREF(val_tr_idx);
-                if (!(val_idx == -1 && PyErr_Occurred())) {
-                    DatabaseObject *db = (DatabaseObject *)ts->db;
-                    PyObject *obj_rec = PyList_GetItem(db->objects, obj_idx);
-                    if (obj_rec) {
-                        ObjectRecordObject *orec = (ObjectRecordObject *)obj_rec;
-                        PyObject *val_int = PyLong_FromLong(val_idx);
-                        PyDict_SetItem(orec->members, name, val_int);
-                        Py_DECREF(val_int);
-                    }
-                }
-            } else {
-                PyErr_Clear();
-            }
+    ObjectTraceData *val_trace = (ObjectTraceData *)PyObject_GetExtra(value);
+    if (val_trace) {
+        DatabaseObject *db = (DatabaseObject *)ts->db;
+        PyObject *obj_rec = PyList_GetItem(db->objects, (Py_ssize_t)trace_data->id);
+        if (obj_rec) {
+            ObjectRecordObject *orec = (ObjectRecordObject *)obj_rec;
+            PyObject *val_int = PyLong_FromUnsignedLongLong(val_trace->id);
+            PyDict_SetItem(orec->members, name, val_int);
+            Py_DECREF(val_int);
+        }
+    }
 
-            /* wrap containers */
-            int is_dict = PyDict_Check(value);
-            int is_list = PyList_Check(value);
-            int is_deque = 0;
-            if (!is_dict && !is_list) {
-                PyObject *qn = PyObject_GetAttrString((PyObject *)Py_TYPE(value), "__qualname__");
-                if (qn) {
-                    const char *qns = PyUnicode_AsUTF8(qn);
-                    if (qns && strcmp(qns, "deque") == 0) is_deque = 1;
-                    Py_DECREF(qn);
-                }
-            }
+    /* wrap containers */
+    int is_dict = PyDict_Check(value);
+    int is_list = PyList_Check(value);
+    int is_deque = 0;
+    if (!is_dict && !is_list) {
+        PyObject *qn = PyObject_GetAttrString((PyObject *)Py_TYPE(value), "__qualname__");
+        if (qn) {
+            const char *qns = PyUnicode_AsUTF8(qn);
+            if (qns && strcmp(qns, "deque") == 0) is_deque = 1;
+            Py_DECREF(qn);
+        }
+    }
 
-            int is_wrapped = 0;
-            PyObject *tw = PyObject_GetAttrString(value, "_tr_wrapped");
-            if (tw) {
-                is_wrapped = PyObject_IsTrue(tw);
-                Py_DECREF(tw);
-            } else {
-                PyErr_Clear();
-            }
+    ObjectTraceData *vt = (ObjectTraceData *)PyObject_GetExtra(value);
+    int is_wrapped = vt && vt->type != CONTAINER_NONE;
 
-            if ((is_dict || is_list || is_deque) && !is_wrapped) {
-                PyObject *wrapped = wrap_container_inner(
-                    value, ts->db, (int)obj_idx);
-                if (wrapped) {
-                    PyObject *b2 = PyImport_ImportModule("builtins");
-                    PyObject *ot2 = b2 ? PyObject_GetAttrString(b2, "object") : NULL;
-                    Py_XDECREF(b2);
-                    if (ot2) {
-                        PyObject *sa2 = PyObject_GetAttrString(ot2, "__setattr__");
-                        if (sa2) {
-                            PyObject *r3 = PyObject_CallFunctionObjArgs(
-                                sa2, self_obj, name, wrapped, NULL);
-                            Py_XDECREF(r3);
-                            Py_DECREF(sa2);
-                        }
-                        Py_DECREF(ot2);
-                    }
-                    Py_DECREF(wrapped);
-                } else {
-                    PyErr_Clear();
+    if ((is_dict || is_list || is_deque) && !is_wrapped) {
+        PyObject *wrapped = wrap_container(
+            value, ts->db, (int)trace_data->id);
+        if (wrapped) {
+            PyObject *b2 = PyImport_ImportModule("builtins");
+            PyObject *ot2 = b2 ? PyObject_GetAttrString(b2, "object") : NULL;
+            Py_XDECREF(b2);
+            if (ot2) {
+                PyObject *sa2 = PyObject_GetAttrString(ot2, "__setattr__");
+                if (sa2) {
+                    PyObject *r3 = PyObject_CallFunctionObjArgs(
+                        sa2, self_obj, name, wrapped, NULL);
+                    Py_XDECREF(r3);
+                    Py_DECREF(sa2);
                 }
+                Py_DECREF(ot2);
             }
+            Py_DECREF(wrapped);
         } else {
             PyErr_Clear();
         }
-    } else {
-        PyErr_Clear();
     }
 
     Py_RETURN_NONE;
@@ -339,32 +287,25 @@ static PyObject *traced_getattr_call_impl(TracedGetattrObject *tg,
     if (name_str[0] == '_' && name_str[1] == '_')
         return value;
 
-    /* look up __arw_<name> */
-    char arw_key[256];
-    snprintf(arw_key, sizeof(arw_key), "__arw_%s", name_str);
-    PyObject *arw_name = PyUnicode_FromString(arw_key);
-    PyObject *arw = PyObject_CallFunctionObjArgs(tg->original, self_obj, arw_name, NULL);
-    Py_DECREF(arw_name);
-    if (!arw) { PyErr_Clear(); return value; }
+    /* look up ARW from the object's trace data */
+    ObjectTraceData *trace_data = (ObjectTraceData *)PyObject_GetExtra(self_obj);
+    if (!trace_data) return value;
 
-    /* check it's an AttrRecordWrite */
-    if (!Py_IS_TYPE(arw, AttrRecordWriteType)) {
-        Py_DECREF(arw);
+    ARW arw;
+    if (!ARWMap_get(&trace_data->attrs, name_str, &arw))
         return value;
-    }
 
     PyFrameObject *frame_ptr = PyEval_GetFrame();
     if (frame_ptr) {
-        uint64_t caller_id = ((PyFrameObject *)frame_ptr)->call_id;
+        uint64_t caller_id = frame_ptr->f_frame->call_id;
         int read_lineno = PyFrame_GetLineNumber(frame_ptr);
-        int write_lineno = ((AttrRecordWriteObject *)arw)->call_lineno;
 
         PyObject *rec = py_current_record(NULL, NULL);
         if (rec && rec != Py_None) {
             CallRecordObject *cr = (CallRecordObject *)rec;
             PyObject *attr_read = PyObject_CallFunction(
                 (PyObject *)AttrRecordReadType,
-                "Kii", caller_id, write_lineno, read_lineno);
+                "Kii", caller_id, arw.call_lineno, read_lineno);
             if (attr_read) {
                 PyList_Append(cr->attr_reads, attr_read);
                 Py_DECREF(attr_read);
@@ -377,7 +318,6 @@ static PyObject *traced_getattr_call_impl(TracedGetattrObject *tg,
         }
     }
 
-    Py_DECREF(arw);
     return value;
 }
 

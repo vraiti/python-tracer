@@ -24,25 +24,35 @@ int umap_get(const UMap *m, uintptr_t key, intptr_t *out);
 void umap_set(UMap *m, uintptr_t key, intptr_t value);
 int umap_contains(const UMap *m, uintptr_t key);
 
-/* ---- string-keyed map (key: owned char*, value: void*) ---- */
+/* ---- string-keyed map macro ---- */
+
+#define DECLARE_STRMAP(PREFIX, VTYPE)                                   \
+    typedef struct {                                                    \
+        char *key;                                                      \
+        VTYPE value;                                                    \
+        uint8_t occupied;                                               \
+    } PREFIX##Entry;                                                    \
+                                                                        \
+    typedef struct {                                                    \
+        PREFIX##Entry *entries;                                         \
+        size_t capacity;                                                \
+        size_t count;                                                   \
+    } PREFIX;                                                           \
+                                                                        \
+    void PREFIX##_init(PREFIX *m, size_t initial_cap);                  \
+    void PREFIX##_free(PREFIX *m);                                      \
+    int PREFIX##_get(const PREFIX *m, const char *key, VTYPE *out);     \
+    void PREFIX##_set(PREFIX *m, const char *key, VTYPE value);         \
+    int PREFIX##_contains(const PREFIX *m, const char *key);
 
 typedef struct {
-    char *key;
-    void *value;
-    uint8_t occupied;
-} SMapEntry;
+    uint64_t caller_id;
+    int32_t call_lineno;
+} ARW;
 
-typedef struct {
-    SMapEntry *entries;
-    size_t capacity;
-    size_t count;
-} SMap;
+DECLARE_STRMAP(SMap, void *)
+DECLARE_STRMAP(ARWMap, ARW)
 
-void smap_init(SMap *m, size_t initial_cap);
-void smap_free(SMap *m);
 void smap_free_values(SMap *m);
-int smap_get(const SMap *m, const char *key, void **out);
-void smap_set(SMap *m, const char *key, void *value);
-int smap_contains(const SMap *m, const char *key);
 
 #endif

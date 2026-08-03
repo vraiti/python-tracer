@@ -151,6 +151,22 @@ def install_torch(version: str | None):
     build_deps: list[str] = []
     seen_build: set[str] = set()
     install_build_deps.collect_deps_from_toml(data, build_deps, seen_build)
+
+    skip_dirs = {"docs", "test", "dev"}
+    visited = set()
+    for req_file in repo_dir.rglob("requirements*.txt"):
+        if any(part for part in req_file.parts if any(s in part for s in skip_dirs)):
+            continue
+        print(f"  scanning {req_file.relative_to(repo_dir)}")
+        for line in req_file.read_text().splitlines():
+            line = line.strip()
+            if "#" in line:
+                line = line[:line.index("#")].strip()
+            if not line or line.startswith("-"):
+                continue
+            pkg = install_build_deps.strip_extras(line)
+            install_build_deps.collect_deps(pkg, visited, build_deps, seen_build)
+
     if build_deps:
         print(f"  torch build deps: {build_deps}")
         subprocess.run([
@@ -160,6 +176,16 @@ def install_torch(version: str | None):
         ] + build_deps, **RUN)
 
     os.environ["USE_NNPACK"] = "0"
+    os.environ["USE_DISTRIBUTED"] = "0"
+    os.environ["USE_NCCL"] = "0"
+    os.environ["USE_TENSORPIPE"] = "0"
+    os.environ["USE_GLOO"] = "0"
+    os.environ["USE_XNNPACK"] = "0"
+    os.environ["USE_FBGEMM"] = "0"
+    os.environ["USE_QNNPACK"] = "0"
+    os.environ["USE_KINETO"] = "0"
+    os.environ["BUILD_TEST"] = "0"
+    os.environ["BUILD_CAFFE2"] = "0"
 
     print("installing pytorch...")
     v = int(os.environ.get("PTRACE_PIP_V", "0"))
