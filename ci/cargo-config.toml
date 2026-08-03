@@ -1,6 +1,0 @@
-[patch.crates-io]
-pyo3-ffi = { path = "/src/pyo3/pyo3-ffi" }
-pyo3 = { path = "/src/pyo3" }
-pyo3-build-config = { path = "/src/pyo3/pyo3-build-config" }
-pyo3-macros = { path = "/src/pyo3/pyo3-macros" }
-pyo3-macros-backend = { path = "/src/pyo3/pyo3-macros-backend" }
