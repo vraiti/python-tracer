@@ -15,7 +15,7 @@ TRACER_SO := tracer/_tracer$(EXT_SUFFIX)
 TRACER_SRCS := $(wildcard tracer/csrc/*.c) $(wildcard tracer/csrc/containers/*.c)
 TRACER_HDRS := $(wildcard tracer/csrc/*.h) $(wildcard tracer/csrc/containers/*.h)
 
-.PHONY: all cpython install clean ext
+.PHONY: all cpython install clean ext test
 
 all: ext
 
@@ -48,6 +48,9 @@ $(CPYTHON_STAMP): $(CPYTHON_SRCS) $(CPYTHON_BIN) $(PREFIX)
 
 install: $(CPYTHON_STAMP) ext
 	$(PREFIX)/bin/python3 -m pip install -e .
+
+test: $(CPYTHON_BIN) ext
+	PYTHONPATH=$(CURDIR) $(CPYTHON_BIN) tests/test.py
 
 clean:
 	cd $(CPYTHON_DIR) && $(MAKE) clean 2>/dev/null || true

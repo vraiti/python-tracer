@@ -72,6 +72,30 @@ void umap_set(UMap *m, uintptr_t key, intptr_t value) {
     }
 }
 
+int umap_delete(UMap *m, uintptr_t key) {
+    if (!m->entries) return 0;
+    size_t mask = m->capacity - 1;
+    size_t idx = umap_hash(key) & mask;
+    for (size_t i = 0; i < m->capacity; i++) {
+        size_t pos = (idx + i) & mask;
+        if (!m->entries[pos].occupied) return 0;
+        if (m->entries[pos].key == key) {
+            m->entries[pos].occupied = 0;
+            m->count--;
+            size_t next = (pos + 1) & mask;
+            while (m->entries[next].occupied) {
+                UMapEntry e = m->entries[next];
+                m->entries[next].occupied = 0;
+                m->count--;
+                umap_set(m, e.key, e.value);
+                next = (next + 1) & mask;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int umap_contains(const UMap *m, uintptr_t key) {
     intptr_t dummy;
     return umap_get(m, key, &dummy);

@@ -1,7 +1,8 @@
 #include "containers.h"
-#include "internal/pycore_frame.h"
 #include <stdlib.h>
 #include <string.h>
+
+extern ObjectTraceData *get_trace_data(PyObject *obj);
 
 /* ======================================================================== */
 /* ARWList — dynamic array with CPython's resize algorithm                   */
@@ -115,7 +116,7 @@ arwlist_len(const ARWList *l)
 PyTypeObject *TracedListType = NULL;
 
 static inline ListTraceData *get_list_trace(PyObject *self) {
-    return (ListTraceData *)PyObject_GetExtra(self);
+    return (ListTraceData *)get_trace_data(self);
 }
 
 static int TracedList_init(PyObject *self, PyObject *args, PyObject *kw) {
@@ -149,7 +150,7 @@ static int TracedList_init(PyObject *self, PyObject *args, PyObject *kw) {
     for (Py_ssize_t i = 0; i < n; i++)
         arwlist_append(&td->arws, zero);
 
-    PyObject_SetExtra(self, td);
+    umap_set(&g_state.object_extras, (uintptr_t)self, (intptr_t)td);
     return 0;
 }
 

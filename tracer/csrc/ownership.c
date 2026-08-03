@@ -1,14 +1,15 @@
 #include "ownership.h"
 #include "hook.h"
 #include "containers/containers.h"
-#include "internal/pycore_frame.h"
 #include <string.h>
 
 /* forward declaration from containers.c */
 extern PyObject *wrap_container(PyObject *value, PyObject *db, int obj_idx);
 
-/* forward declaration from hook.c — access frame stack peek */
+/* forward declaration from hook.c */
 extern PyObject *py_current_record(PyObject *self, PyObject *args);
+extern uint64_t get_frame_call_id(PyFrameObject *frame);
+extern ObjectTraceData *get_trace_data(PyObject *obj);
 
 /* ========== TracedSetattr ========== */
 
@@ -68,13 +69,13 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
     Py_DECREF(res);
 
     /* look up trace data for this object */
-    ObjectTraceData *trace_data = (ObjectTraceData *)PyObject_GetExtra(self_obj);
+    ObjectTraceData *trace_data = get_trace_data(self_obj);
     if (!trace_data) Py_RETURN_NONE;
 
     /* record the write in the ARWMap */
     PyFrameObject *frame_ptr = PyEval_GetFrame();
     if (frame_ptr) {
-        uint64_t caller_id = frame_ptr->f_frame->call_id;
+        uint64_t caller_id = get_frame_call_id(frame_ptr);
         int call_lineno = PyFrame_GetLineNumber(frame_ptr);
         ARW arw = {caller_id, call_lineno};
         ARWMap_set(&trace_data->attrs, name_str, arw);
@@ -84,7 +85,7 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
         Py_RETURN_NONE;
 
     /* track member relationships */
-    ObjectTraceData *val_trace = (ObjectTraceData *)PyObject_GetExtra(value);
+    ObjectTraceData *val_trace = get_trace_data(value);
     if (val_trace) {
         DatabaseObject *db = (DatabaseObject *)ts->db;
         PyObject *obj_rec = PyList_GetItem(db->objects, (Py_ssize_t)trace_data->id);
@@ -109,7 +110,7 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
         }
     }
 
-    ObjectTraceData *vt = (ObjectTraceData *)PyObject_GetExtra(value);
+    ObjectTraceData *vt = get_trace_data(value);
     int is_wrapped = vt && vt->type != CONTAINER_NONE;
 
     if ((is_dict || is_list || is_deque) && !is_wrapped) {
@@ -288,7 +289,7 @@ static PyObject *traced_getattr_call_impl(TracedGetattrObject *tg,
         return value;
 
     /* look up ARW from the object's trace data */
-    ObjectTraceData *trace_data = (ObjectTraceData *)PyObject_GetExtra(self_obj);
+    ObjectTraceData *trace_data = get_trace_data(self_obj);
     if (!trace_data) return value;
 
     ARW arw;
@@ -297,7 +298,7 @@ static PyObject *traced_getattr_call_impl(TracedGetattrObject *tg,
 
     PyFrameObject *frame_ptr = PyEval_GetFrame();
     if (frame_ptr) {
-        uint64_t caller_id = frame_ptr->f_frame->call_id;
+        uint64_t caller_id = get_frame_call_id(frame_ptr);
         int read_lineno = PyFrame_GetLineNumber(frame_ptr);
 
         PyObject *rec = py_current_record(NULL, NULL);

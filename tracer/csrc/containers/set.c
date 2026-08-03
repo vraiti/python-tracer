@@ -1,7 +1,8 @@
 #include "containers.h"
-#include "internal/pycore_frame.h"
 #include <stdlib.h>
 #include <string.h>
+
+extern ObjectTraceData *get_trace_data(PyObject *obj);
 
 /* ======================================================================== */
 /* ARWSet — open-addressing hash table keyed by Py_hash_t                    */
@@ -211,7 +212,7 @@ arwset_resize(ARWSet *s, size_t minused)
 PyTypeObject *TracedSetType = NULL;
 
 static inline SetTraceData *get_set_trace(PyObject *self) {
-    return (SetTraceData *)PyObject_GetExtra(self);
+    return (SetTraceData *)get_trace_data(self);
 }
 
 static int TracedSet_init(PyObject *self, PyObject *args, PyObject *kw) {
@@ -253,7 +254,7 @@ static int TracedSet_init(PyObject *self, PyObject *args, PyObject *kw) {
         Py_DECREF(iter);
     }
 
-    PyObject_SetExtra(self, td);
+    umap_set(&g_state.object_extras, (uintptr_t)self, (intptr_t)td);
     return 0;
 }
 

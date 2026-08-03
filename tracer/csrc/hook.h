@@ -38,6 +38,13 @@ typedef struct {
     size_t branch_cap;
 } FrameEntry;
 
+/* Per-(thread, coroutine) frame stack */
+typedef struct {
+    FrameEntry *entries;
+    size_t count;
+    size_t cap;
+} FrameStack;
+
 /* Global trace state */
 typedef struct {
     uint64_t next_call_id;
@@ -60,10 +67,11 @@ typedef struct {
     int32_t next_func_id;
     SMap cf_bits;             /* ref_str -> Bitset* (heap-allocated) */
 
-    /* Frame stack */
-    FrameEntry *frames;
-    size_t frame_count;
-    size_t frame_cap;
+    /* Object extras: (uintptr_t)PyObject* -> (intptr_t)ObjectTraceData* */
+    UMap object_extras;
+
+    /* Frame call_id map: (uintptr_t)_PyInterpreterFrame* -> (intptr_t)call_id */
+    UMap frame_call_ids;
 } TraceState;
 
 extern TraceState g_state;

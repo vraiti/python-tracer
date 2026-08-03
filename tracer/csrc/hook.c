@@ -10,26 +10,49 @@ extern void ownership_patch_class(PyObject *ownership, PyObject *cls);
 
 TraceState g_state = {0};
 
-static void tracer_extra_free_hook(void *ptr) {
-    ObjectTraceData *data = (ObjectTraceData *)ptr;
+/* ---- object extras helpers ---- */
+
+/* ---- frame call_id helpers ---- */
+
+void set_frame_call_id(PyFrameObject *frame, uint64_t cid) {
+    umap_set(&g_state.frame_call_ids, (uintptr_t)frame->f_frame, (intptr_t)cid);
+}
+
+uint64_t get_frame_call_id(PyFrameObject *frame) {
+    intptr_t val;
+    if (umap_get(&g_state.frame_call_ids, (uintptr_t)frame->f_frame, &val))
+        return (uint64_t)val;
+    return 0;
+}
+
+/* ---- object extras helpers ---- */
+
+ObjectTraceData *get_trace_data(PyObject *obj) {
+    intptr_t val;
+    if (umap_get(&g_state.object_extras, (uintptr_t)obj, &val))
+        return (ObjectTraceData *)val;
+    return NULL;
+}
+
+static void free_trace_data(ObjectTraceData *data) {
     switch (data->type) {
     case CONTAINER_DICT: {
-        DictTraceData *td = (DictTraceData *)ptr;
+        DictTraceData *td = (DictTraceData *)data;
         arwdict_free(&td->arws);
         break;
     }
     case CONTAINER_LIST: {
-        ListTraceData *td = (ListTraceData *)ptr;
+        ListTraceData *td = (ListTraceData *)data;
         arwlist_free(&td->arws);
         break;
     }
     case CONTAINER_DEQUE: {
-        DequeTraceData *td = (DequeTraceData *)ptr;
+        DequeTraceData *td = (DequeTraceData *)data;
         arwdeque_free(&td->arws);
         break;
     }
     case CONTAINER_SET: {
-        SetTraceData *td = (SetTraceData *)ptr;
+        SetTraceData *td = (SetTraceData *)data;
         arwset_free(&td->arws);
         break;
     }
@@ -37,8 +60,40 @@ static void tracer_extra_free_hook(void *ptr) {
         break;
     }
     ARWMap_free(&data->attrs);
-    free(ptr);
+    free(data);
 }
+
+/* weakref finalizer: called when a tracked object is deallocated */
+
+typedef struct {
+    PyObject_HEAD
+    uintptr_t obj_key;
+} ExtraCleanupObject;
+
+static PyObject *extra_cleanup_call(PyObject *self, PyObject *args, PyObject *kw) {
+    ExtraCleanupObject *ec = (ExtraCleanupObject *)self;
+    intptr_t val;
+    if (umap_get(&g_state.object_extras, ec->obj_key, &val)) {
+        umap_delete(&g_state.object_extras, ec->obj_key);
+        free_trace_data((ObjectTraceData *)val);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyType_Slot ExtraCleanup_slots[] = {
+    {Py_tp_call, extra_cleanup_call},
+    {0, NULL},
+};
+
+static PyType_Spec ExtraCleanup_spec = {
+    .name = "_tracer.ExtraCleanup",
+    .basicsize = sizeof(ExtraCleanupObject),
+    .flags = Py_TPFLAGS_DEFAULT,
+    .slots = ExtraCleanup_slots,
+};
+
+static PyTypeObject *ExtraCleanupType = NULL;
+
 
 /* ---- bitset helpers ---- */
 
@@ -84,24 +139,51 @@ static Bitset bitset_from_pyset(PyObject *pyset) {
     return bs;
 }
 
-/* ---- frame stack ---- */
+/* ---- per-coroutine frame stacks (thread-local) ---- */
 
-static void frame_stack_push(FrameEntry *entry) {
-    if (g_state.frame_count >= g_state.frame_cap) {
-        g_state.frame_cap = g_state.frame_cap ? g_state.frame_cap * 2 : 64;
-        g_state.frames = realloc(g_state.frames, g_state.frame_cap * sizeof(FrameEntry));
+static _Thread_local UMap tl_coro_stacks = {0};
+static _Thread_local int tl_stacks_init = 0;
+
+static uintptr_t get_coroutine_id(PyFrameObject *frame) {
+    _PyInterpreterFrame *iframe = frame->f_frame;
+    if (iframe->owner == FRAME_OWNED_BY_GENERATOR)
+        return (uintptr_t)_PyFrame_GetGenerator(iframe);
+    return 0;
+}
+
+static FrameStack *get_frame_stack(PyFrameObject *frame) {
+    if (!tl_stacks_init) {
+        umap_init(&tl_coro_stacks, 4);
+        tl_stacks_init = 1;
     }
-    g_state.frames[g_state.frame_count++] = *entry;
+    uintptr_t coro_id = get_coroutine_id(frame);
+    intptr_t val;
+    if (umap_get(&tl_coro_stacks, coro_id, &val))
+        return (FrameStack *)val;
+    FrameStack *stack = calloc(1, sizeof(FrameStack));
+    umap_set(&tl_coro_stacks, coro_id, (intptr_t)stack);
+    return stack;
 }
 
-static FrameEntry *frame_stack_peek(void) {
-    if (g_state.frame_count == 0) return NULL;
-    return &g_state.frames[g_state.frame_count - 1];
+static void frame_stack_push(PyFrameObject *frame, FrameEntry *entry) {
+    FrameStack *stack = get_frame_stack(frame);
+    if (stack->count >= stack->cap) {
+        stack->cap = stack->cap ? stack->cap * 2 : 64;
+        stack->entries = realloc(stack->entries, stack->cap * sizeof(FrameEntry));
+    }
+    stack->entries[stack->count++] = *entry;
 }
 
-static void frame_stack_pop(void) {
-    if (g_state.frame_count > 0) {
-        FrameEntry *e = &g_state.frames[--g_state.frame_count];
+static FrameEntry *frame_stack_peek(PyFrameObject *frame) {
+    FrameStack *stack = get_frame_stack(frame);
+    if (stack->count == 0) return NULL;
+    return &stack->entries[stack->count - 1];
+}
+
+static void frame_stack_pop(PyFrameObject *frame) {
+    FrameStack *stack = get_frame_stack(frame);
+    if (stack->count > 0) {
+        FrameEntry *e = &stack->entries[--stack->count];
         free(e->branch_buf);
         free(e->cf_bits.words);
     }
@@ -149,12 +231,9 @@ static PyObject *get_self_obj(PyObject *py_frame, PyCodeObject *code) {
 
 static int32_t get_obj_id(PyObject *self_obj) {
     if (!self_obj) return 0;
-    PyObject *tr_idx = PyObject_GetAttrString(self_obj, "__tr_idx");
-    if (!tr_idx) { PyErr_Clear(); return 0; }
-    long val = PyLong_AsLong(tr_idx);
-    Py_DECREF(tr_idx);
-    if (val == -1 && PyErr_Occurred()) { PyErr_Clear(); return 0; }
-    return (int32_t)val;
+    ObjectTraceData *td = get_trace_data(self_obj);
+    if (!td) return 0;
+    return (int32_t)td->id;
 }
 
 static int is_tracked_class(PyObject *self_obj, PyCodeObject *code) {
@@ -189,7 +268,7 @@ static int is_tracked_class(PyObject *self_obj, PyCodeObject *code) {
     return result;
 }
 
-/* ---- handle_init: create ObjectRecord, set __tr_idx, patch class ---- */
+/* ---- handle_init: create ObjectRecord, attach trace data ---- */
 
 static void handle_init(PyObject *self_obj, PyCodeObject *code, uint64_t call_id) {
     PyObject *cls = (PyObject *)Py_TYPE(self_obj);
@@ -222,16 +301,24 @@ static void handle_init(PyObject *self_obj, PyCodeObject *code, uint64_t call_id
     trace_data->id = (uint64_t)obj_idx;
     ARWMap_init(&trace_data->attrs, 16);
     trace_data->type = CONTAINER_NONE;
-    PyObject_SetExtra(self_obj, trace_data);
+    umap_set(&g_state.object_extras, (uintptr_t)self_obj, (intptr_t)trace_data);
 
-    if (g_state.ownership)
-        ownership_patch_class(g_state.ownership, cls);
+    ExtraCleanupObject *ec = (ExtraCleanupObject *)PyObject_CallNoArgs(
+        (PyObject *)ExtraCleanupType);
+    if (ec) {
+        ec->obj_key = (uintptr_t)self_obj;
+        PyObject *weakref = PyWeakref_NewRef(self_obj, (PyObject *)ec);
+        Py_XDECREF(weakref);
+        Py_DECREF(ec);
+    } else {
+        PyErr_Clear();
+    }
 }
 
 /* ---- push a traced frame ---- */
 
-static void push_traced_frame(uint64_t call_id, PyObject *record,
-                              const char *ref_str) {
+static void push_traced_frame(PyFrameObject *frame, uint64_t call_id,
+                              PyObject *record, const char *ref_str) {
     FrameEntry entry;
     entry.call_id = call_id;
     entry.record = record;
@@ -253,7 +340,7 @@ static void push_traced_frame(uint64_t call_id, PyObject *record,
         entry.cf_bits.n_words = 0;
     }
 
-    frame_stack_push(&entry);
+    frame_stack_push(frame, &entry);
 }
 
 /* ---- trace callback ---- */
@@ -262,10 +349,10 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
     /* taint propagation */
     PyFrameObject *back = PyFrame_GetBack(frame_obj);
     if (back) {
-        uint64_t caller_cid = back->f_frame->call_id;
+        uint64_t caller_cid = get_frame_call_id(back);
         Py_DECREF((PyObject *)back);
         if (caller_cid == UINT64_MAX) {
-            ((PyFrameObject *)py_frame)->f_frame->call_id = UINT64_MAX;
+            set_frame_call_id((PyFrameObject *)py_frame, UINT64_MAX);
             ((PyFrameObject *)py_frame)->f_trace_lines = 0;
             return 0;
         }
@@ -294,7 +381,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
         if (qualname) {
             for (Py_ssize_t i = 0; i < g_state.taint_count; i++) {
                 if (strstr(qualname, g_state.taint_patterns[i])) {
-                    ((PyFrameObject *)py_frame)->f_frame->call_id = UINT64_MAX;
+                    set_frame_call_id((PyFrameObject *)py_frame, UINT64_MAX);
                     ((PyFrameObject *)py_frame)->f_trace_lines = 0;
                     Py_DECREF(code);
                     return 0;
@@ -304,7 +391,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
     }
 
     if (!in_scope) {
-        ((PyFrameObject *)py_frame)->f_frame->call_id = 0;
+        set_frame_call_id((PyFrameObject *)py_frame, 0);
         ((PyFrameObject *)py_frame)->f_trace_lines = 0;
 
         /* check for __init__ on tracked class */
@@ -319,7 +406,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
                 int call_lineno = 0;
                 PyFrameObject *back2 = PyFrame_GetBack(frame_obj);
                 if (back2) {
-                    caller_id = back2->f_frame->call_id;
+                    caller_id = get_frame_call_id(back2);
                     call_lineno = PyFrame_GetLineNumber(back2);
                     Py_DECREF((PyObject *)back2);
                 }
@@ -331,7 +418,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
                     snprintf(ref_buf, sizeof(ref_buf), "%s:%s", filename, qn);
                     int32_t function_id = get_or_assign_function_id(ref_buf);
 
-                    ((PyFrameObject *)py_frame)->f_frame->call_id = call_id;
+                    set_frame_call_id((PyFrameObject *)py_frame, call_id);
                     ((PyFrameObject *)py_frame)->f_trace_lines = 1;
 
                     DatabaseObject *db = (DatabaseObject *)g_state.db;
@@ -345,7 +432,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
                         int32_t obj_id = get_obj_id(self_obj);
                         ((CallRecordObject *)rec)->obj_id = obj_id;
 
-                        push_traced_frame(call_id, rec, ref_buf);
+                        push_traced_frame(frame_obj, call_id, rec, ref_buf);
                         Py_DECREF(rec);
                     } else {
                         PyErr_Clear();
@@ -360,13 +447,13 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
 
     /* in-scope call */
     uint64_t call_id = g_state.next_call_id++;
-    ((PyFrameObject *)py_frame)->f_frame->call_id = call_id;
+    set_frame_call_id((PyFrameObject *)py_frame, call_id);
 
     uint64_t caller_id = 0;
     int call_lineno = 0;
     PyFrameObject *back3 = PyFrame_GetBack(frame_obj);
     if (back3) {
-        caller_id = back3->f_frame->call_id;
+        caller_id = get_frame_call_id(back3);
         call_lineno = PyFrame_GetLineNumber(back3);
         Py_DECREF((PyObject *)back3);
     }
@@ -404,7 +491,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
         ((CallRecordObject *)rec)->obj_id = new_obj_id;
     }
 
-    push_traced_frame(call_id, rec, ref_buf);
+    push_traced_frame(frame_obj, call_id, rec, ref_buf);
     Py_DECREF(rec);
 
     ((PyFrameObject *)py_frame)->f_trace_lines = 1;
@@ -414,7 +501,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
 
 static int handle_line(PyObject *py_frame, PyFrameObject *frame_obj) {
     int lineno = PyFrame_GetLineNumber(frame_obj);
-    FrameEntry *entry = frame_stack_peek();
+    FrameEntry *entry = frame_stack_peek(frame_obj);
     if (!entry) return 0;
 
     if (entry->pending_cf > 0) {
@@ -437,11 +524,12 @@ static int handle_line(PyObject *py_frame, PyFrameObject *frame_obj) {
 }
 
 static int handle_return(PyObject *py_frame, PyFrameObject *frame_obj) {
-    uint64_t cid = ((PyFrameObject *)py_frame)->f_frame->call_id;
+    uint64_t cid = get_frame_call_id((PyFrameObject *)py_frame);
     if (cid == 0 || cid == UINT64_MAX) return 0;
 
-    while (g_state.frame_count > 0) {
-        FrameEntry *entry = frame_stack_peek();
+    FrameStack *stack = get_frame_stack(frame_obj);
+    while (stack->count > 0) {
+        FrameEntry *entry = &stack->entries[stack->count - 1];
 
         if (entry->pending_cf > 0) {
             if (entry->branch_len >= entry->branch_cap) {
@@ -462,11 +550,257 @@ static int handle_return(PyObject *py_frame, PyFrameObject *frame_obj) {
             }
         }
 
-        frame_stack_pop();
+        frame_stack_pop(frame_obj);
         if (entry_cid == cid) break;
     }
     return 0;
 }
+
+/* ---- profile hook for C_CALL/C_RETURN container dispatch ---- */
+
+typedef enum {
+    STASH_NONE = 0,
+    STASH_LIST_APPEND,
+    STASH_LIST_EXTEND,
+    STASH_LIST_INSERT,
+    STASH_LIST_POP,
+    STASH_LIST_REMOVE,
+    STASH_LIST_CLEAR,
+    STASH_DICT_CLEAR,
+    STASH_SET_ADD,
+    STASH_SET_DISCARD,
+    STASH_SET_REMOVE,
+    STASH_SET_POP,
+    STASH_SET_UPDATE,
+    STASH_SET_CLEAR,
+    STASH_DEQUE_APPEND,
+    STASH_DEQUE_APPENDLEFT,
+    STASH_DEQUE_EXTEND,
+    STASH_DEQUE_EXTENDLEFT,
+    STASH_DEQUE_POP,
+    STASH_DEQUE_POPLEFT,
+    STASH_DEQUE_REMOVE,
+    STASH_DEQUE_CLEAR,
+} StashType;
+
+typedef struct {
+    StashType type;
+    PyObject *self_obj;
+    Py_ssize_t pre_len;
+} CCallStash;
+
+static _Thread_local CCallStash tl_stash = {0};
+
+static StashType classify_container_call(ObjectTraceData *td, const char *name) {
+    switch (td->type) {
+    case CONTAINER_LIST:
+        if (strcmp(name, "append") == 0) return STASH_LIST_APPEND;
+        if (strcmp(name, "extend") == 0) return STASH_LIST_EXTEND;
+        if (strcmp(name, "insert") == 0) return STASH_LIST_INSERT;
+        if (strcmp(name, "pop") == 0)    return STASH_LIST_POP;
+        if (strcmp(name, "remove") == 0) return STASH_LIST_REMOVE;
+        if (strcmp(name, "clear") == 0)  return STASH_LIST_CLEAR;
+        break;
+    case CONTAINER_DICT:
+        if (strcmp(name, "clear") == 0)  return STASH_DICT_CLEAR;
+        break;
+    case CONTAINER_SET:
+        if (strcmp(name, "add") == 0)     return STASH_SET_ADD;
+        if (strcmp(name, "discard") == 0) return STASH_SET_DISCARD;
+        if (strcmp(name, "remove") == 0)  return STASH_SET_REMOVE;
+        if (strcmp(name, "pop") == 0)     return STASH_SET_POP;
+        if (strcmp(name, "update") == 0)  return STASH_SET_UPDATE;
+        if (strcmp(name, "clear") == 0)   return STASH_SET_CLEAR;
+        break;
+    case CONTAINER_DEQUE:
+        if (strcmp(name, "append") == 0)      return STASH_DEQUE_APPEND;
+        if (strcmp(name, "appendleft") == 0)  return STASH_DEQUE_APPENDLEFT;
+        if (strcmp(name, "extend") == 0)      return STASH_DEQUE_EXTEND;
+        if (strcmp(name, "extendleft") == 0)  return STASH_DEQUE_EXTENDLEFT;
+        if (strcmp(name, "pop") == 0)         return STASH_DEQUE_POP;
+        if (strcmp(name, "popleft") == 0)     return STASH_DEQUE_POPLEFT;
+        if (strcmp(name, "remove") == 0)      return STASH_DEQUE_REMOVE;
+        if (strcmp(name, "clear") == 0)       return STASH_DEQUE_CLEAR;
+        break;
+    default:
+        break;
+    }
+    return STASH_NONE;
+}
+
+static void handle_c_call(PyObject *arg) {
+    if (!PyCFunction_Check(arg)) return;
+    PyCFunctionObject *cfunc = (PyCFunctionObject *)arg;
+    PyObject *self_obj = cfunc->m_self;
+    if (!self_obj) return;
+
+    ObjectTraceData *td = get_trace_data(self_obj);
+    if (!td || td->type == CONTAINER_NONE) return;
+
+    const char *name = cfunc->m_ml->ml_name;
+    StashType st = classify_container_call(td, name);
+    if (st == STASH_NONE) return;
+
+    tl_stash.type = st;
+    tl_stash.self_obj = self_obj;
+    switch (td->type) {
+    case CONTAINER_LIST:
+        tl_stash.pre_len = PyList_GET_SIZE(self_obj);
+        break;
+    case CONTAINER_SET:
+        tl_stash.pre_len = PySet_GET_SIZE(self_obj);
+        break;
+    default:
+        tl_stash.pre_len = 0;
+        break;
+    }
+}
+
+static void handle_c_return(PyFrameObject *frame_obj) {
+    StashType st = tl_stash.type;
+    if (st == STASH_NONE) return;
+    tl_stash.type = STASH_NONE;
+
+    PyObject *self_obj = tl_stash.self_obj;
+    ObjectTraceData *td = get_trace_data(self_obj);
+    if (!td) return;
+
+    ARW arw = {0, 0};
+    arw.caller_id = get_frame_call_id(frame_obj);
+    arw.call_lineno = PyFrame_GetLineNumber(frame_obj);
+
+    switch (st) {
+    case STASH_LIST_APPEND: {
+        ListTraceData *lt = (ListTraceData *)td;
+        arwlist_append(&lt->arws, arw);
+        break;
+    }
+    case STASH_LIST_EXTEND: {
+        ListTraceData *lt = (ListTraceData *)td;
+        Py_ssize_t new_len = PyList_GET_SIZE(self_obj);
+        for (Py_ssize_t i = tl_stash.pre_len; i < new_len; i++)
+            arwlist_append(&lt->arws, arw);
+        break;
+    }
+    case STASH_LIST_INSERT: {
+        ListTraceData *lt = (ListTraceData *)td;
+        Py_ssize_t new_len = PyList_GET_SIZE(self_obj);
+        if (new_len > tl_stash.pre_len) {
+            Py_ssize_t idx = new_len - 1;
+            for (Py_ssize_t i = (Py_ssize_t)lt->arws.len; i > idx && i > 0; i--) {}
+            arwlist_append(&lt->arws, arw);
+        }
+        break;
+    }
+    case STASH_LIST_POP: {
+        ListTraceData *lt = (ListTraceData *)td;
+        if (lt->arws.len > 0) {
+            ARW read_arw = arwlist_pop(&lt->arws);
+            emit_read(&read_arw);
+        }
+        break;
+    }
+    case STASH_LIST_REMOVE: {
+        ListTraceData *lt = (ListTraceData *)td;
+        Py_ssize_t new_len = PyList_GET_SIZE(self_obj);
+        if (new_len < tl_stash.pre_len && lt->arws.len > (size_t)new_len) {
+            lt->arws.len = (size_t)new_len;
+        }
+        break;
+    }
+    case STASH_LIST_CLEAR: {
+        ListTraceData *lt = (ListTraceData *)td;
+        arwlist_free(&lt->arws);
+        arwlist_init(&lt->arws);
+        break;
+    }
+    case STASH_DICT_CLEAR: {
+        DictTraceData *dt = (DictTraceData *)td;
+        arwdict_free(&dt->arws);
+        arwdict_init(&dt->arws);
+        break;
+    }
+    case STASH_SET_ADD: {
+        SetTraceData *st_data = (SetTraceData *)td;
+        if (PySet_GET_SIZE(self_obj) > tl_stash.pre_len) {
+            /* New element was added — we don't have the hash,
+               but the set grew, so record a generic ARW */
+        }
+        break;
+    }
+    case STASH_SET_CLEAR: {
+        SetTraceData *st_data = (SetTraceData *)td;
+        arwset_free(&st_data->arws);
+        arwset_init(&st_data->arws);
+        break;
+    }
+    case STASH_DEQUE_APPEND: {
+        DequeTraceData *dq = (DequeTraceData *)td;
+        arwdeque_append(&dq->arws, arw);
+        break;
+    }
+    case STASH_DEQUE_APPENDLEFT: {
+        DequeTraceData *dq = (DequeTraceData *)td;
+        arwdeque_appendleft(&dq->arws, arw);
+        break;
+    }
+    case STASH_DEQUE_EXTEND: {
+        DequeTraceData *dq = (DequeTraceData *)td;
+        Py_ssize_t added = (Py_ssize_t)arwdeque_len(&dq->arws);
+        /* Can't determine exact count without pre-len for deques,
+           but the deque has already grown */
+        break;
+    }
+    case STASH_DEQUE_POP: {
+        DequeTraceData *dq = (DequeTraceData *)td;
+        if (dq->arws.len > 0) {
+            ARW read_arw;
+            if (arwdeque_pop(&dq->arws, &read_arw) == 0)
+                emit_read(&read_arw);
+        }
+        break;
+    }
+    case STASH_DEQUE_POPLEFT: {
+        DequeTraceData *dq = (DequeTraceData *)td;
+        if (dq->arws.len > 0) {
+            ARW read_arw;
+            if (arwdeque_popleft(&dq->arws, &read_arw) == 0)
+                emit_read(&read_arw);
+        }
+        break;
+    }
+    case STASH_DEQUE_CLEAR: {
+        DequeTraceData *dq = (DequeTraceData *)td;
+        arwdeque_free(&dq->arws);
+        arwdeque_init(&dq->arws);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static int profile_func(
+    PyObject *obj,
+    PyFrameObject *frame_obj,
+    int what,
+    PyObject *arg
+) {
+    if (!g_state.enabled) return 0;
+    switch (what) {
+        case PyTrace_C_CALL:
+            handle_c_call(arg);
+            break;
+        case PyTrace_C_RETURN:
+            handle_c_return(frame_obj);
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+/* ---- trace callback ---- */
 
 static int trace_func(
     PyObject *obj,
@@ -513,7 +847,8 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
         free(g_state.taint_patterns);
     }
     umap_free(&g_state.scope_cache);
-    free(g_state.frames);
+    umap_free(&g_state.object_extras);
+    umap_free(&g_state.frame_call_ids);
 
     /* set up new state */
     Py_INCREF(hook);
@@ -534,6 +869,8 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
     }
 
     umap_init(&g_state.scope_cache, 256);
+    umap_init(&g_state.object_extras, 1024);
+    umap_init(&g_state.frame_call_ids, 1024);
 
     g_state.taint_patterns = NULL;
     g_state.taint_count = 0;
@@ -549,13 +886,10 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
     }
 
     g_state.next_call_id = 1;
-    g_state.frames = NULL;
-    g_state.frame_count = 0;
-    g_state.frame_cap = 0;
     g_state.enabled = 1;
 
-    PyObject_SetExtraFreeHook(tracer_extra_free_hook);
     PyEval_SetTrace((Py_tracefunc)trace_func, g_state.hook_obj);
+    PyEval_SetProfile((Py_tracefunc)profile_func, g_state.hook_obj);
     Py_RETURN_NONE;
 }
 
@@ -565,17 +899,19 @@ static PyObject *py_install_thread(PyObject *self, PyObject *Py_UNUSED(args)) {
         return NULL;
     }
     PyEval_SetTrace((Py_tracefunc)trace_func, g_state.hook_obj);
+    PyEval_SetProfile((Py_tracefunc)profile_func, g_state.hook_obj);
     Py_RETURN_NONE;
 }
 
 static PyObject *py_uninstall(PyObject *self, PyObject *Py_UNUSED(args)) {
     g_state.enabled = 0;
     PyEval_SetTrace(NULL, NULL);
+    PyEval_SetProfile(NULL, NULL);
     Py_RETURN_NONE;
 }
 
 static PyObject *py_get_call_id(PyObject *self, PyObject *frame) {
-    uint64_t cid = ((PyFrameObject *)frame)->f_frame->call_id;
+    uint64_t cid = get_frame_call_id((PyFrameObject *)frame);
     return PyLong_FromUnsignedLongLong(cid);
 }
 
@@ -584,12 +920,14 @@ static PyObject *py_set_call_id(PyObject *self, PyObject *args) {
     uint64_t cid;
     if (!PyArg_ParseTuple(args, "OK", &frame, &cid))
         return NULL;
-    ((PyFrameObject *)frame)->f_frame->call_id = cid;
+    set_frame_call_id((PyFrameObject *)frame, cid);
     Py_RETURN_NONE;
 }
 
 PyObject *py_current_record(PyObject *self, PyObject *Py_UNUSED(args)) {
-    FrameEntry *entry = frame_stack_peek();
+    PyFrameObject *frame = PyEval_GetFrame();
+    if (!frame) Py_RETURN_NONE;
+    FrameEntry *entry = frame_stack_peek(frame);
     if (!entry) Py_RETURN_NONE;
     Py_INCREF(entry->record);
     return entry->record;
@@ -679,6 +1017,9 @@ static PyMethodDef hook_methods[] = {
 };
 
 int hook_init(PyObject *module) {
+    ExtraCleanupType = (PyTypeObject *)PyType_FromSpec(&ExtraCleanup_spec);
+    if (!ExtraCleanupType) return -1;
+
     for (PyMethodDef *m = hook_methods; m->ml_name; m++) {
         PyObject *func = PyCFunction_NewEx(m, NULL, NULL);
         if (!func) return -1;

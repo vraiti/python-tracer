@@ -22,6 +22,7 @@ void umap_init(UMap *m, size_t initial_cap);
 void umap_free(UMap *m);
 int umap_get(const UMap *m, uintptr_t key, intptr_t *out);
 void umap_set(UMap *m, uintptr_t key, intptr_t value);
+int umap_delete(UMap *m, uintptr_t key);
 int umap_contains(const UMap *m, uintptr_t key);
 
 /* ---- string-keyed map macro ---- */

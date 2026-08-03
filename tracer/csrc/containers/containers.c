@@ -1,15 +1,16 @@
 #include "containers.h"
-#include "internal/pycore_frame.h"
 #include <string.h>
 #include <stdlib.h>
 
 extern PyObject *py_current_record(PyObject *self, PyObject *args);
+extern uint64_t get_frame_call_id(PyFrameObject *frame);
+extern ObjectTraceData *get_trace_data(PyObject *obj);
 
 ARW caller_arw(void) {
     ARW e = {0, 0};
     PyFrameObject *frame = PyEval_GetFrame();
     if (!frame) return e;
-    e.caller_id = frame->f_frame->call_id;
+    e.caller_id = get_frame_call_id(frame);
     e.call_lineno = PyFrame_GetLineNumber(frame);
     return e;
 }
@@ -19,7 +20,7 @@ void emit_read(const ARW *arw) {
     if (!frame) return;
     PyObject *rec = py_current_record(NULL, NULL);
     if (!rec || rec == Py_None) { Py_XDECREF(rec); return; }
-    uint64_t caller_id = frame->f_frame->call_id;
+    uint64_t caller_id = get_frame_call_id(frame);
     int lineno = PyFrame_GetLineNumber(frame);
     PyObject *attr_read = PyObject_CallFunction(
         (PyObject *)AttrRecordReadType,
@@ -34,7 +35,7 @@ void emit_read(const ARW *arw) {
 }
 
 PyObject *wrap_container(PyObject *value, PyObject *db, int obj_idx) {
-    ObjectTraceData *existing = (ObjectTraceData *)PyObject_GetExtra(value);
+    ObjectTraceData *existing = get_trace_data(value);
     if (existing && existing->type != CONTAINER_NONE)
         Py_RETURN_NONE;
 

@@ -1,7 +1,8 @@
 #include "containers.h"
-#include "internal/pycore_frame.h"
 #include <stdlib.h>
 #include <assert.h>
+
+extern ObjectTraceData *get_trace_data(PyObject *obj);
 
 /* ======================================================================== */
 /* ARWDeque — doubly-linked list of fixed-size blocks                        */
@@ -177,7 +178,7 @@ PyTypeObject *TracedDequeType = NULL;
 static PyTypeObject *deque_type_obj = NULL;
 
 static inline DequeTraceData *get_deque_trace(PyObject *self) {
-    return (DequeTraceData *)PyObject_GetExtra(self);
+    return (DequeTraceData *)get_trace_data(self);
 }
 
 static PyObject *deque_base_call(PyObject *self, const char *method, PyObject *arg) {
@@ -223,7 +224,7 @@ static int TracedDeque_init(PyObject *self, PyObject *args, PyObject *kw) {
     for (Py_ssize_t i = 0; i < n; i++)
         arwdeque_append(&td->arws, zero);
 
-    PyObject_SetExtra(self, td);
+    umap_set(&g_state.object_extras, (uintptr_t)self, (intptr_t)td);
     return 0;
 }
 

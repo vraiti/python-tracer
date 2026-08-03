@@ -1,7 +1,8 @@
 #include "containers.h"
-#include "internal/pycore_frame.h"
 #include <stdlib.h>
 #include <string.h>
+
+extern ObjectTraceData *get_trace_data(PyObject *obj);
 
 /* ======================================================================== */
 /* ARWDict — compact string-keyed hash table for ARW values                  */
@@ -236,7 +237,7 @@ arwdict_len(const ARWDict *d)
 PyTypeObject *TracedDictType = NULL;
 
 static inline DictTraceData *get_dict_trace(PyObject *self) {
-    return (DictTraceData *)PyObject_GetExtra(self);
+    return (DictTraceData *)get_trace_data(self);
 }
 
 static int TracedDict_init(PyObject *self, PyObject *args, PyObject *kw) {
@@ -264,7 +265,7 @@ static int TracedDict_init(PyObject *self, PyObject *args, PyObject *kw) {
     ARWMap_init(&td->base.attrs, 0);
     td->base.type = CONTAINER_DICT;
     arwdict_init(&td->arws);
-    PyObject_SetExtra(self, td);
+    umap_set(&g_state.object_extras, (uintptr_t)self, (intptr_t)td);
     return 0;
 }
 
