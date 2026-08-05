@@ -1,4 +1,6 @@
+import glob
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -21,11 +23,13 @@ TABLES = [
 ]
 
 
-def run_trace(db_path):
+def run_trace(output_dir):
     env = os.environ.copy()
     env["PYTHONPATH"] = TESTS
+    env["PYTHON_TRACER_CONFIG"] = CONFIG
+    env["PYTHON_TRACER_OUTDIR"] = output_dir
     result = subprocess.run(
-        [CPYTHON, "-m", "tracer", "--config", CONFIG, "--output", db_path, "--", SCRIPT],
+        [CPYTHON, "-m", "d3g", "--", SCRIPT],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -34,6 +38,10 @@ def run_trace(db_path):
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         raise RuntimeError(f"tracer exited with {result.returncode}")
+    dbs = sorted(glob.glob(os.path.join(output_dir, "*.db")))
+    if not dbs:
+        raise RuntimeError("no trace database produced")
+    return dbs[-1]
 
 
 def normalize_ref(ref):
@@ -57,7 +65,9 @@ def dump(db_path):
 
 
 def generate_reference():
-    run_trace(REFERENCE)
+    with tempfile.TemporaryDirectory() as d:
+        db_path = run_trace(d)
+        shutil.copy2(db_path, REFERENCE)
     print(f"Reference trace written to {REFERENCE}", file=sys.stderr)
 
 
@@ -67,10 +77,8 @@ def test_trace():
         generate_reference()
         return
 
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        run_trace(db_path)
+    with tempfile.TemporaryDirectory() as d:
+        db_path = run_trace(d)
         ref = dump(REFERENCE)
         got = dump(db_path)
         for name, _ in TABLES:
@@ -81,8 +89,6 @@ def test_trace():
                 f"  expected: {ref[name]}\n"
                 f"  got:      {got[name]}"
             )
-    finally:
-        os.unlink(db_path)
 
     print("PASS")
 
