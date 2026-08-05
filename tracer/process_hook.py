@@ -15,12 +15,10 @@ class ProcessHook:
     def __init__(
         self,
         prefixes: list[str],
-        output_dir: str,
         tracked_classes: list[str] | None = None,
         taint_patterns: list[str] | None = None,
     ) -> None:
         self.prefixes = prefixes
-        self.output_dir = output_dir
         self.tracked_classes = tracked_classes
         self.taint_patterns = taint_patterns
 
@@ -41,7 +39,6 @@ class ProcessHook:
                 wrapped = _TracedTarget(
                     target,
                     hook.prefixes,
-                    output_dir=hook.output_dir,
                     tracked_classes=hook.tracked_classes,
                     taint_patterns=hook.taint_patterns,
                 )
@@ -76,13 +73,11 @@ class _TracedTarget:
         self,
         original_target: Any,
         prefixes: list[str],
-        output_dir: str,
         tracked_classes: list[str] | None = None,
         taint_patterns: list[str] | None = None,
     ) -> None:
         self.original_target = original_target
         self.prefixes = prefixes
-        self.output_dir = output_dir
         self.tracked_classes = tracked_classes
         self.taint_patterns = taint_patterns
 
@@ -91,35 +86,28 @@ class _TracedTarget:
 
         from tracer._tracer import (
             Database,
-            OwnershipHook,
             PathFilter,
             install,
             install_thread,
-            load_ast_data,
             uninstall,
         )
-        from tracer.ast_index import AstIndex
         from tracer.ipc import patch_message_queue
 
         pid = os.getpid()
-        output_file = os.path.join(self.output_dir, f"{pid}.db")
+        output_dir = os.environ.get("PYTHON_TRACER_OUTDIR", "traces")
+        output_file = os.path.join(output_dir, f"{pid}.db")
 
         path_filter = PathFilter(prefixes=self.prefixes, tracked_classes=self.tracked_classes)
-        ast_index = AstIndex()
-        ast_index.preprocess(path_filter)
 
         db = Database()
 
         from tracer.__main__ import TraceHook
         hook = TraceHook(db, path_filter)
-        ownership = OwnershipHook(db, hook)
-
-        load_ast_data(ast_index._func_to_id, ast_index._control_flow_lines)
 
         patch_message_queue(db)
 
         prefixes = list(path_filter._prefixes)
-        install(hook, prefixes, db, ownership, path_filter, taint_patterns=self.taint_patterns)
+        install(hook, prefixes, db, path_filter, taint_patterns=self.taint_patterns)
 
         _original_run = threading.Thread.run
         def _patched_run(self_thread: threading.Thread) -> None:
@@ -136,8 +124,7 @@ class _TracedTarget:
             written = True
             uninstall()
             try:
-                from tracer.__main__ import serialize
-                serialize(db, output_file)
+                db.serialize(output_file)
             except Exception:
                 import traceback
                 traceback.print_exc()

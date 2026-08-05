@@ -2,9 +2,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-extern PyObject *py_current_record(PyObject *self, PyObject *args);
 extern uint64_t get_frame_call_id(PyFrameObject *frame);
 extern ObjectTraceData *get_trace_data(PyObject *obj);
+extern CallRecordData *current_record(void);
 
 ARW caller_arw(void) {
     ARW e = {0, 0};
@@ -18,20 +18,11 @@ ARW caller_arw(void) {
 void emit_read(const ARW *arw) {
     PyFrameObject *frame = PyEval_GetFrame();
     if (!frame) return;
-    PyObject *rec = py_current_record(NULL, NULL);
-    if (!rec || rec == Py_None) { Py_XDECREF(rec); return; }
+    CallRecordData *rec = current_record();
+    if (!rec) return;
     uint64_t caller_id = get_frame_call_id(frame);
     int lineno = PyFrame_GetLineNumber(frame);
-    PyObject *attr_read = PyObject_CallFunction(
-        (PyObject *)AttrRecordReadType,
-        "Kii", caller_id, arw->call_lineno, lineno);
-    if (attr_read) {
-        PyList_Append(((CallRecordObject *)rec)->attr_reads, attr_read);
-        Py_DECREF(attr_read);
-    } else {
-        PyErr_Clear();
-    }
-    Py_DECREF(rec);
+    db_add_attr_read(rec, caller_id, arw->call_lineno, lineno);
 }
 
 PyObject *wrap_container(PyObject *value, PyObject *db, int obj_idx) {

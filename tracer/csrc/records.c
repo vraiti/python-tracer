@@ -1,499 +1,424 @@
 #include "records.h"
-#include <structmember.h>
+#include "hook.h"
+#include <sqlite3.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-/* ========== AttrRecordWrite ========== */
+#define INITIAL_CAP 256
 
-PyTypeObject *AttrRecordWriteType = NULL;
+/* ========== C array helpers ========== */
 
-static int AttrRecordWrite_init(PyObject *self, PyObject *args, PyObject *kw) {
-    AttrRecordWriteObject *o = (AttrRecordWriteObject *)self;
-    static char *kwlist[] = {"caller_id", "call_lineno", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "Ki", kwlist,
-            &o->caller_id, &o->call_lineno))
-        return -1;
-    return 0;
+CallRecordData *db_add_call(DatabaseObject *db,
+                            uint64_t call_id, int32_t function_id,
+                            uint64_t caller_id, int32_t call_lineno,
+                            int32_t obj_id) {
+    if (db->calls_len >= db->calls_cap) {
+        Py_ssize_t new_cap = db->calls_cap ? db->calls_cap * 2 : INITIAL_CAP;
+        CallRecordData *tmp = realloc(db->calls, new_cap * sizeof(CallRecordData));
+        if (!tmp) return NULL;
+        db->calls = tmp;
+        db->calls_cap = new_cap;
+    }
+    CallRecordData *rec = &db->calls[db->calls_len++];
+    rec->call_id = call_id;
+    rec->function_id = function_id;
+    rec->caller_id = caller_id;
+    rec->call_lineno = call_lineno;
+    rec->obj_id = obj_id;
+    rec->control_flow = NULL;
+    rec->control_flow_len = 0;
+    rec->attr_reads = NULL;
+    rec->attr_reads_len = 0;
+    rec->attr_reads_cap = 0;
+    return rec;
 }
 
-static PyObject *AttrRecordWrite_reduce(PyObject *self, PyObject *Py_UNUSED(ignored)) {
-    AttrRecordWriteObject *o = (AttrRecordWriteObject *)self;
-    PyObject *mod = PyImport_ImportModule("tracer._tracer");
-    if (!mod) return NULL;
-    PyObject *cls = PyObject_GetAttrString(mod, "AttrRecordWrite");
-    Py_DECREF(mod);
-    if (!cls) return NULL;
-    PyObject *args = Py_BuildValue("(Ki)", o->caller_id, o->call_lineno);
-    if (!args) { Py_DECREF(cls); return NULL; }
-    PyObject *result = PyTuple_Pack(2, cls, args);
-    Py_DECREF(cls);
-    Py_DECREF(args);
-    return result;
+Py_ssize_t db_add_object(DatabaseObject *db, uint64_t call_id) {
+    if (db->objects_len >= db->objects_cap) {
+        Py_ssize_t new_cap = db->objects_cap ? db->objects_cap * 2 : INITIAL_CAP;
+        ObjectRecordData *tmp = realloc(db->objects, new_cap * sizeof(ObjectRecordData));
+        if (!tmp) return -1;
+        db->objects = tmp;
+        db->objects_cap = new_cap;
+    }
+    Py_ssize_t idx = db->objects_len++;
+    ObjectRecordData *obj = &db->objects[idx];
+    obj->call_id = call_id;
+    SMap_init(&obj->members, 8);
+    return idx;
 }
 
-static PyMethodDef AttrRecordWrite_methods[] = {
-    {"__reduce__", AttrRecordWrite_reduce, METH_NOARGS, NULL},
-    {NULL}
-};
-
-static PyMemberDef AttrRecordWrite_members[] = {
-    {"caller_id", Py_T_ULONGLONG, offsetof(AttrRecordWriteObject, caller_id), Py_READONLY, NULL},
-    {"call_lineno", Py_T_INT, offsetof(AttrRecordWriteObject, call_lineno), Py_READONLY, NULL},
-    {NULL}
-};
-
-static PyType_Slot AttrRecordWrite_slots[] = {
-    {Py_tp_init,    AttrRecordWrite_init},
-    {Py_tp_methods, AttrRecordWrite_methods},
-    {Py_tp_members, AttrRecordWrite_members},
-    {0, NULL}
-};
-
-static PyType_Spec AttrRecordWrite_spec = {
-    .name = "tracer._tracer.AttrRecordWrite",
-    .basicsize = sizeof(AttrRecordWriteObject),
-    .flags = Py_TPFLAGS_DEFAULT,
-    .slots = AttrRecordWrite_slots,
-};
-
-/* ========== AttrRecordRead ========== */
-
-PyTypeObject *AttrRecordReadType = NULL;
-
-static int AttrRecordRead_init(PyObject *self, PyObject *args, PyObject *kw) {
-    AttrRecordReadObject *o = (AttrRecordReadObject *)self;
-    static char *kwlist[] = {"caller_id", "write_call_lineno", "read_call_lineno", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "Kii", kwlist,
-            &o->caller_id, &o->write_call_lineno, &o->read_call_lineno))
-        return -1;
-    return 0;
+void db_add_ipc_entry(DatabaseObject *db, const char *name, int64_t obj_idx) {
+    if (db->ipc_len >= db->ipc_cap) {
+        Py_ssize_t new_cap = db->ipc_cap ? db->ipc_cap * 2 : 16;
+        IpcRecordData *tmp = realloc(db->ipc, new_cap * sizeof(IpcRecordData));
+        if (!tmp) return;
+        db->ipc = tmp;
+        db->ipc_cap = new_cap;
+    }
+    IpcRecordData *entry = &db->ipc[db->ipc_len++];
+    entry->name = strdup(name);
+    entry->obj_idx = obj_idx;
 }
 
-static PyObject *AttrRecordRead_reduce(PyObject *self, PyObject *Py_UNUSED(ignored)) {
-    AttrRecordReadObject *o = (AttrRecordReadObject *)self;
-    PyObject *mod = PyImport_ImportModule("tracer._tracer");
-    if (!mod) return NULL;
-    PyObject *cls = PyObject_GetAttrString(mod, "AttrRecordRead");
-    Py_DECREF(mod);
-    if (!cls) return NULL;
-    PyObject *args = Py_BuildValue("(Kii)", o->caller_id, o->write_call_lineno, o->read_call_lineno);
-    if (!args) { Py_DECREF(cls); return NULL; }
-    PyObject *result = PyTuple_Pack(2, cls, args);
-    Py_DECREF(cls);
-    Py_DECREF(args);
-    return result;
+void db_add_attr_read(CallRecordData *rec,
+                      uint64_t caller_id,
+                      int32_t write_call_lineno,
+                      int32_t read_call_lineno) {
+    if (rec->attr_reads_len >= rec->attr_reads_cap) {
+        Py_ssize_t new_cap = rec->attr_reads_cap ? rec->attr_reads_cap * 2 : 8;
+        AttrRecordReadData *tmp = realloc(rec->attr_reads,
+                                          new_cap * sizeof(AttrRecordReadData));
+        if (!tmp) return;
+        rec->attr_reads = tmp;
+        rec->attr_reads_cap = new_cap;
+    }
+    AttrRecordReadData *ar = &rec->attr_reads[rec->attr_reads_len++];
+    ar->caller_id = caller_id;
+    ar->write_call_lineno = write_call_lineno;
+    ar->read_call_lineno = read_call_lineno;
 }
 
-static PyMethodDef AttrRecordRead_methods[] = {
-    {"__reduce__", AttrRecordRead_reduce, METH_NOARGS, NULL},
-    {NULL}
-};
+void db_set_arw(DatabaseObject *db, int32_t obj_id, const char *attr_name,
+                uint64_t caller_id, int32_t call_lineno) {
+    char key[300];
+    snprintf(key, sizeof(key), "%d:%s", obj_id, attr_name);
 
-static PyMemberDef AttrRecordRead_members[] = {
-    {"caller_id", Py_T_ULONGLONG, offsetof(AttrRecordReadObject, caller_id), Py_READONLY, NULL},
-    {"write_call_lineno", Py_T_INT, offsetof(AttrRecordReadObject, write_call_lineno), Py_READONLY, NULL},
-    {"read_call_lineno", Py_T_INT, offsetof(AttrRecordReadObject, read_call_lineno), Py_READONLY, NULL},
-    {NULL}
-};
-
-static PyType_Slot AttrRecordRead_slots[] = {
-    {Py_tp_init,    AttrRecordRead_init},
-    {Py_tp_methods, AttrRecordRead_methods},
-    {Py_tp_members, AttrRecordRead_members},
-    {0, NULL}
-};
-
-static PyType_Spec AttrRecordRead_spec = {
-    .name = "tracer._tracer.AttrRecordRead",
-    .basicsize = sizeof(AttrRecordReadObject),
-    .flags = Py_TPFLAGS_DEFAULT,
-    .slots = AttrRecordRead_slots,
-};
-
-/* ========== CallRecord ========== */
-
-PyTypeObject *CallRecordType = NULL;
-
-static int CallRecord_init(PyObject *self, PyObject *args, PyObject *kw) {
-    CallRecordObject *o = (CallRecordObject *)self;
-    static char *kwlist[] = {"call_id", "function_id", "caller_id", "call_lineno", "obj_id", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "KiKii", kwlist,
-            &o->call_id, &o->function_id, &o->caller_id, &o->call_lineno, &o->obj_id))
-        return -1;
-    o->control_flow = PyByteArray_FromStringAndSize("", 0);
-    if (!o->control_flow) return -1;
-    o->attr_reads = PyList_New(0);
-    if (!o->attr_reads) { Py_CLEAR(o->control_flow); return -1; }
-    return 0;
+    AttrRecordWriteData *existing;
+    if (SMap_get(&db->arw_map, key, (void **)&existing)) {
+        existing->caller_id = caller_id;
+        existing->call_lineno = call_lineno;
+    } else {
+        AttrRecordWriteData *arw = malloc(sizeof(AttrRecordWriteData));
+        if (!arw) return;
+        arw->caller_id = caller_id;
+        arw->call_lineno = call_lineno;
+        SMap_set(&db->arw_map, key, arw);
+    }
 }
 
-static void CallRecord_dealloc(PyObject *self) {
-    CallRecordObject *o = (CallRecordObject *)self;
-    PyObject_GC_UnTrack(self);
-    Py_XDECREF(o->control_flow);
-    Py_XDECREF(o->attr_reads);
-    Py_TYPE(self)->tp_free(self);
+AttrRecordWriteData *db_get_arw(DatabaseObject *db, int32_t obj_id,
+                                const char *attr_name) {
+    char key[300];
+    snprintf(key, sizeof(key), "%d:%s", obj_id, attr_name);
+    AttrRecordWriteData *out;
+    if (SMap_get(&db->arw_map, key, (void **)&out))
+        return out;
+    return NULL;
 }
 
-static int CallRecord_traverse(PyObject *self, visitproc visit, void *arg) {
-    CallRecordObject *o = (CallRecordObject *)self;
-    Py_VISIT(o->control_flow);
-    Py_VISIT(o->attr_reads);
-    return 0;
-}
-
-static int CallRecord_clear(PyObject *self) {
-    CallRecordObject *o = (CallRecordObject *)self;
-    Py_CLEAR(o->control_flow);
-    Py_CLEAR(o->attr_reads);
-    return 0;
-}
-
-static PyObject *CallRecord_append_branch(PyObject *self, PyObject *arg) {
-    CallRecordObject *o = (CallRecordObject *)self;
-    int taken = PyObject_IsTrue(arg);
-    if (taken < 0) return NULL;
-    char byte = taken ? 1 : 0;
-    Py_ssize_t len = PyByteArray_GET_SIZE(o->control_flow);
-    if (PyByteArray_Resize(o->control_flow, len + 1) < 0) return NULL;
-    PyByteArray_AS_STRING(o->control_flow)[len] = byte;
-    Py_RETURN_NONE;
-}
-
-static PyObject *CallRecord_append_attr_read(PyObject *self, PyObject *arg) {
-    CallRecordObject *o = (CallRecordObject *)self;
-    if (PyList_Append(o->attr_reads, arg) < 0) return NULL;
-    Py_RETURN_NONE;
-}
-
-static PyObject *CallRecord_reduce(PyObject *self, PyObject *Py_UNUSED(ignored)) {
-    CallRecordObject *o = (CallRecordObject *)self;
-    PyObject *mod = PyImport_ImportModule("tracer._tracer");
-    if (!mod) return NULL;
-    PyObject *cls = PyObject_GetAttrString(mod, "CallRecord");
-    Py_DECREF(mod);
-    if (!cls) return NULL;
-    PyObject *args = Py_BuildValue("(KiKii)", o->call_id, o->function_id,
-                                    o->caller_id, o->call_lineno, o->obj_id);
-    if (!args) { Py_DECREF(cls); return NULL; }
-    PyObject *result = PyTuple_Pack(2, cls, args);
-    Py_DECREF(cls);
-    Py_DECREF(args);
-    return result;
-}
-
-static PyMethodDef CallRecord_methods[] = {
-    {"append_branch", CallRecord_append_branch, METH_O, NULL},
-    {"append_attr_read", CallRecord_append_attr_read, METH_O, NULL},
-    {"__reduce__", CallRecord_reduce, METH_NOARGS, NULL},
-    {NULL}
-};
-
-static PyMemberDef CallRecord_members[] = {
-    {"call_id", Py_T_ULONGLONG, offsetof(CallRecordObject, call_id), Py_READONLY, NULL},
-    {"function_id", Py_T_INT, offsetof(CallRecordObject, function_id), Py_READONLY, NULL},
-    {"caller_id", Py_T_ULONGLONG, offsetof(CallRecordObject, caller_id), Py_READONLY, NULL},
-    {"call_lineno", Py_T_INT, offsetof(CallRecordObject, call_lineno), Py_READONLY, NULL},
-    {"obj_id", Py_T_INT, offsetof(CallRecordObject, obj_id), 0, NULL},
-    {"control_flow", Py_T_OBJECT_EX, offsetof(CallRecordObject, control_flow), 0, NULL},
-    {"attr_reads", Py_T_OBJECT_EX, offsetof(CallRecordObject, attr_reads), Py_READONLY, NULL},
-    {NULL}
-};
-
-static PyType_Slot CallRecord_slots[] = {
-    {Py_tp_init,     CallRecord_init},
-    {Py_tp_dealloc,  CallRecord_dealloc},
-    {Py_tp_traverse, CallRecord_traverse},
-    {Py_tp_clear,    CallRecord_clear},
-    {Py_tp_methods,  CallRecord_methods},
-    {Py_tp_members,  CallRecord_members},
-    {0, NULL}
-};
-
-static PyType_Spec CallRecord_spec = {
-    .name = "tracer._tracer.CallRecord",
-    .basicsize = sizeof(CallRecordObject),
-    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
-    .slots = CallRecord_slots,
-};
-
-/* ========== ObjectRecord ========== */
-
-PyTypeObject *ObjectRecordType = NULL;
-
-static int ObjectRecord_init(PyObject *self, PyObject *args, PyObject *kw) {
-    ObjectRecordObject *o = (ObjectRecordObject *)self;
-    static char *kwlist[] = {"call_id", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "K", kwlist, &o->call_id))
-        return -1;
-    o->members = PyDict_New();
-    if (!o->members) return -1;
-    return 0;
-}
-
-static void ObjectRecord_dealloc(PyObject *self) {
-    ObjectRecordObject *o = (ObjectRecordObject *)self;
-    PyObject_GC_UnTrack(self);
-    Py_XDECREF(o->members);
-    Py_TYPE(self)->tp_free(self);
-}
-
-static int ObjectRecord_traverse(PyObject *self, visitproc visit, void *arg) {
-    ObjectRecordObject *o = (ObjectRecordObject *)self;
-    Py_VISIT(o->members);
-    return 0;
-}
-
-static int ObjectRecord_clear(PyObject *self) {
-    ObjectRecordObject *o = (ObjectRecordObject *)self;
-    Py_CLEAR(o->members);
-    return 0;
-}
-
-static PyObject *ObjectRecord_reduce(PyObject *self, PyObject *Py_UNUSED(ignored)) {
-    ObjectRecordObject *o = (ObjectRecordObject *)self;
-    PyObject *mod = PyImport_ImportModule("tracer._tracer");
-    if (!mod) return NULL;
-    PyObject *cls = PyObject_GetAttrString(mod, "ObjectRecord");
-    Py_DECREF(mod);
-    if (!cls) return NULL;
-    PyObject *args = Py_BuildValue("(K)", o->call_id);
-    if (!args) { Py_DECREF(cls); return NULL; }
-    PyObject *result = PyTuple_Pack(2, cls, args);
-    Py_DECREF(cls);
-    Py_DECREF(args);
-    return result;
-}
-
-static PyMethodDef ObjectRecord_methods[] = {
-    {"__reduce__", ObjectRecord_reduce, METH_NOARGS, NULL},
-    {NULL}
-};
-
-static PyMemberDef ObjectRecord_members[] = {
-    {"call_id", Py_T_ULONGLONG, offsetof(ObjectRecordObject, call_id), Py_READONLY, NULL},
-    {"members", Py_T_OBJECT_EX, offsetof(ObjectRecordObject, members), Py_READONLY, NULL},
-    {NULL}
-};
-
-static PyType_Slot ObjectRecord_slots[] = {
-    {Py_tp_init,     ObjectRecord_init},
-    {Py_tp_dealloc,  ObjectRecord_dealloc},
-    {Py_tp_traverse, ObjectRecord_traverse},
-    {Py_tp_clear,    ObjectRecord_clear},
-    {Py_tp_methods,  ObjectRecord_methods},
-    {Py_tp_members,  ObjectRecord_members},
-    {0, NULL}
-};
-
-static PyType_Spec ObjectRecord_spec = {
-    .name = "tracer._tracer.ObjectRecord",
-    .basicsize = sizeof(ObjectRecordObject),
-    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
-    .slots = ObjectRecord_slots,
-};
-
-/* ========== IpcRecord ========== */
-
-PyTypeObject *IpcRecordType = NULL;
-
-static int IpcRecord_init(PyObject *self, PyObject *args, PyObject *kw) {
-    IpcRecordObject *o = (IpcRecordObject *)self;
-    static char *kwlist[] = {"name", "obj_idx", NULL};
-    PyObject *name = NULL;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "Ol", kwlist, &name, &o->obj_idx))
-        return -1;
-    Py_INCREF(name);
-    o->name = name;
-    return 0;
-}
-
-static void IpcRecord_dealloc(PyObject *self) {
-    IpcRecordObject *o = (IpcRecordObject *)self;
-    PyObject_GC_UnTrack(self);
-    Py_XDECREF(o->name);
-    Py_TYPE(self)->tp_free(self);
-}
-
-static int IpcRecord_traverse(PyObject *self, visitproc visit, void *arg) {
-    IpcRecordObject *o = (IpcRecordObject *)self;
-    Py_VISIT(o->name);
-    return 0;
-}
-
-static int IpcRecord_clear(PyObject *self) {
-    IpcRecordObject *o = (IpcRecordObject *)self;
-    Py_CLEAR(o->name);
-    return 0;
-}
-
-static PyObject *IpcRecord_reduce(PyObject *self, PyObject *Py_UNUSED(ignored)) {
-    IpcRecordObject *o = (IpcRecordObject *)self;
-    PyObject *mod = PyImport_ImportModule("tracer._tracer");
-    if (!mod) return NULL;
-    PyObject *cls = PyObject_GetAttrString(mod, "IpcRecord");
-    Py_DECREF(mod);
-    if (!cls) return NULL;
-    PyObject *args = Py_BuildValue("(Ol)", o->name, o->obj_idx);
-    if (!args) { Py_DECREF(cls); return NULL; }
-    PyObject *result = PyTuple_Pack(2, cls, args);
-    Py_DECREF(cls);
-    Py_DECREF(args);
-    return result;
-}
-
-static PyMethodDef IpcRecord_methods[] = {
-    {"__reduce__", IpcRecord_reduce, METH_NOARGS, NULL},
-    {NULL}
-};
-
-static PyMemberDef IpcRecord_members[] = {
-    {"name", Py_T_OBJECT_EX, offsetof(IpcRecordObject, name), Py_READONLY, NULL},
-    {"obj_idx", Py_T_LONGLONG, offsetof(IpcRecordObject, obj_idx), Py_READONLY, NULL},
-    {NULL}
-};
-
-static PyType_Slot IpcRecord_slots[] = {
-    {Py_tp_init,     IpcRecord_init},
-    {Py_tp_dealloc,  IpcRecord_dealloc},
-    {Py_tp_traverse, IpcRecord_traverse},
-    {Py_tp_clear,    IpcRecord_clear},
-    {Py_tp_methods,  IpcRecord_methods},
-    {Py_tp_members,  IpcRecord_members},
-    {0, NULL}
-};
-
-static PyType_Spec IpcRecord_spec = {
-    .name = "tracer._tracer.IpcRecord",
-    .basicsize = sizeof(IpcRecordObject),
-    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
-    .slots = IpcRecord_slots,
-};
-
-/* ========== Database ========== */
+/* ========== Database Python type ========== */
 
 PyTypeObject *DatabaseType = NULL;
 
 static int Database_init(PyObject *self, PyObject *args, PyObject *kw) {
     DatabaseObject *o = (DatabaseObject *)self;
-    o->calls = PyList_New(0);
-    if (!o->calls) return -1;
-    o->objects = PyList_New(0);
-    if (!o->objects) { Py_CLEAR(o->calls); return -1; }
-    o->ipc = PyList_New(0);
-    if (!o->ipc) { Py_CLEAR(o->calls); Py_CLEAR(o->objects); return -1; }
+    o->calls = NULL;
+    o->calls_len = 0;
+    o->calls_cap = 0;
+    o->objects = NULL;
+    o->objects_len = 0;
+    o->objects_cap = 0;
+    o->ipc = NULL;
+    o->ipc_len = 0;
+    o->ipc_cap = 0;
+    SMap_init(&o->arw_map, 256);
     return 0;
 }
 
 static void Database_dealloc(PyObject *self) {
     DatabaseObject *o = (DatabaseObject *)self;
-    PyObject_GC_UnTrack(self);
-    Py_XDECREF(o->calls);
-    Py_XDECREF(o->objects);
-    Py_XDECREF(o->ipc);
+
+    for (Py_ssize_t i = 0; i < o->calls_len; i++) {
+        free(o->calls[i].control_flow);
+        free(o->calls[i].attr_reads);
+    }
+    free(o->calls);
+
+    for (Py_ssize_t i = 0; i < o->objects_len; i++)
+        SMap_free(&o->objects[i].members);
+    free(o->objects);
+
+    for (Py_ssize_t i = 0; i < o->ipc_len; i++)
+        free(o->ipc[i].name);
+    free(o->ipc);
+
+    smap_free_values(&o->arw_map);
+    SMap_free(&o->arw_map);
+
     Py_TYPE(self)->tp_free(self);
 }
 
-static int Database_traverse(PyObject *self, visitproc visit, void *arg) {
+/* ---- Python methods ---- */
+
+static PyObject *Database_add_ipc(PyObject *self, PyObject *args) {
     DatabaseObject *o = (DatabaseObject *)self;
-    Py_VISIT(o->calls);
-    Py_VISIT(o->objects);
-    Py_VISIT(o->ipc);
+    const char *name;
+    long long obj_idx;
+    if (!PyArg_ParseTuple(args, "sL", &name, &obj_idx))
+        return NULL;
+    db_add_ipc_entry(o, name, (int64_t)obj_idx);
+    Py_RETURN_NONE;
+}
+
+/* ---- serialize ---- */
+
+static int exec_sql(sqlite3 *sdb, const char *sql) {
+    char *err = NULL;
+    if (sqlite3_exec(sdb, sql, NULL, NULL, &err) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", err);
+        sqlite3_free(err);
+        return -1;
+    }
     return 0;
 }
 
-static int Database_clear(PyObject *self) {
-    DatabaseObject *o = (DatabaseObject *)self;
-    Py_CLEAR(o->calls);
-    Py_CLEAR(o->objects);
-    Py_CLEAR(o->ipc);
-    return 0;
-}
+static const char *SCHEMA_SQL =
+    "CREATE TABLE meta (pid INTEGER);"
+    "CREATE TABLE machine (machine_id TEXT NOT NULL);"
+    "CREATE TABLE functions (function_id INTEGER PRIMARY KEY, ref TEXT NOT NULL);"
+    "CREATE TABLE calls ("
+    "    pid INTEGER NOT NULL,"
+    "    call_id INTEGER NOT NULL,"
+    "    function_id INTEGER NOT NULL,"
+    "    caller_id INTEGER NOT NULL,"
+    "    call_lineno INTEGER NOT NULL,"
+    "    obj_id INTEGER NOT NULL,"
+    "    control_flow BLOB,"
+    "    PRIMARY KEY (pid, call_id)"
+    ");"
+    "CREATE TABLE attr_reads ("
+    "    pid INTEGER NOT NULL,"
+    "    call_id INTEGER NOT NULL,"
+    "    caller_id INTEGER NOT NULL,"
+    "    write_call_lineno INTEGER NOT NULL,"
+    "    read_call_lineno INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE objects ("
+    "    pid INTEGER NOT NULL,"
+    "    obj_idx INTEGER NOT NULL,"
+    "    call_id INTEGER NOT NULL,"
+    "    PRIMARY KEY (pid, obj_idx)"
+    ");"
+    "CREATE TABLE members ("
+    "    pid INTEGER NOT NULL,"
+    "    obj_idx INTEGER NOT NULL,"
+    "    attr TEXT NOT NULL,"
+    "    child_idx INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE ipc ("
+    "    pid INTEGER NOT NULL,"
+    "    name TEXT NOT NULL,"
+    "    obj_idx INTEGER NOT NULL"
+    ");";
 
-static PyObject *Database_add_call(PyObject *self, PyObject *arg) {
-    DatabaseObject *o = (DatabaseObject *)self;
-    Py_ssize_t idx = PyList_GET_SIZE(o->calls);
-    if (PyList_Append(o->calls, arg) < 0) return NULL;
-    return PyLong_FromSsize_t(idx);
-}
+#define TAINT_ID UINT64_MAX
 
-static PyObject *Database_add_object(PyObject *self, PyObject *arg) {
+static PyObject *Database_serialize(PyObject *self, PyObject *args) {
     DatabaseObject *o = (DatabaseObject *)self;
-    Py_ssize_t idx = PyList_GET_SIZE(o->objects);
-    if (PyList_Append(o->objects, arg) < 0) return NULL;
-    return PyLong_FromSsize_t(idx);
-}
+    const char *path;
+    if (!PyArg_ParseTuple(args, "s", &path))
+        return NULL;
 
-static PyObject *Database_add_ipc(PyObject *self, PyObject *arg) {
-    DatabaseObject *o = (DatabaseObject *)self;
-    Py_ssize_t idx = PyList_GET_SIZE(o->ipc);
-    if (PyList_Append(o->ipc, arg) < 0) return NULL;
-    return PyLong_FromSsize_t(idx);
-}
+    unlink(path);
 
-static PyObject *Database_reduce(PyObject *self, PyObject *Py_UNUSED(ignored)) {
-    PyObject *mod = PyImport_ImportModule("tracer._tracer");
-    if (!mod) return NULL;
-    PyObject *cls = PyObject_GetAttrString(mod, "Database");
-    Py_DECREF(mod);
-    if (!cls) return NULL;
-    PyObject *args = PyTuple_New(0);
-    if (!args) { Py_DECREF(cls); return NULL; }
-    PyObject *result = PyTuple_Pack(2, cls, args);
-    Py_DECREF(cls);
-    Py_DECREF(args);
-    return result;
+    sqlite3 *sdb;
+    if (sqlite3_open(path, &sdb) != SQLITE_OK) {
+        PyErr_Format(PyExc_OSError, "failed to open %s: %s", path, sqlite3_errmsg(sdb));
+        sqlite3_close(sdb);
+        return NULL;
+    }
+
+    if (exec_sql(sdb, SCHEMA_SQL) < 0)
+        goto fail;
+    if (exec_sql(sdb, "BEGIN TRANSACTION") < 0)
+        goto fail;
+
+    /* meta */
+    {
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(sdb, "INSERT INTO meta VALUES (?)", -1, &st, NULL);
+        sqlite3_bind_int(st, 1, getpid());
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+
+    /* machine */
+    {
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(sdb, "INSERT INTO machine VALUES (?)", -1, &st, NULL);
+        char machine_id[64] = "";
+        FILE *f = fopen("/etc/machine-id", "r");
+        if (f) {
+            if (fgets(machine_id, sizeof(machine_id), f)) {
+                size_t len = strlen(machine_id);
+                if (len > 0 && machine_id[len-1] == '\n')
+                    machine_id[len-1] = '\0';
+            }
+            fclose(f);
+        }
+        sqlite3_bind_text(st, 1, machine_id, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+
+    /* functions from g_state.func_to_id */
+    {
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(sdb,
+            "INSERT INTO functions VALUES (?, ?)", -1, &st, NULL);
+        SMap *fm = &g_state.func_to_id;
+        if (fm->entries) {
+            for (size_t i = 0; i < fm->capacity; i++) {
+                if (!fm->entries[i].occupied) continue;
+                int32_t fid = (int32_t)(intptr_t)fm->entries[i].value;
+                sqlite3_bind_int(st, 1, fid);
+                sqlite3_bind_text(st, 2, fm->entries[i].key, -1, SQLITE_STATIC);
+                sqlite3_step(st);
+                sqlite3_reset(st);
+            }
+        }
+        sqlite3_finalize(st);
+    }
+
+    pid_t pid = getpid();
+
+    /* calls + attr_reads */
+    {
+        sqlite3_stmt *call_st, *ar_st;
+        sqlite3_prepare_v2(sdb,
+            "INSERT INTO calls VALUES (?,?,?,?,?,?,?)", -1, &call_st, NULL);
+        sqlite3_prepare_v2(sdb,
+            "INSERT INTO attr_reads VALUES (?,?,?,?,?)", -1, &ar_st, NULL);
+
+        for (Py_ssize_t i = 0; i < o->calls_len; i++) {
+            CallRecordData *rec = &o->calls[i];
+            uint64_t caller = rec->caller_id == TAINT_ID ? 0 : rec->caller_id;
+
+            sqlite3_bind_int(call_st, 1, pid);
+            sqlite3_bind_int64(call_st, 2, (sqlite3_int64)rec->call_id);
+            sqlite3_bind_int(call_st, 3, rec->function_id);
+            sqlite3_bind_int64(call_st, 4, (sqlite3_int64)caller);
+            sqlite3_bind_int(call_st, 5, rec->call_lineno);
+            sqlite3_bind_int(call_st, 6, rec->obj_id);
+            if (rec->control_flow && rec->control_flow_len > 0)
+                sqlite3_bind_blob(call_st, 7, rec->control_flow,
+                                  (int)rec->control_flow_len, SQLITE_STATIC);
+            else
+                sqlite3_bind_null(call_st, 7);
+            sqlite3_step(call_st);
+            sqlite3_reset(call_st);
+
+            for (Py_ssize_t j = 0; j < rec->attr_reads_len; j++) {
+                AttrRecordReadData *ar = &rec->attr_reads[j];
+                uint64_t ar_caller = ar->caller_id == TAINT_ID ? 0 : ar->caller_id;
+                sqlite3_bind_int(ar_st, 1, pid);
+                sqlite3_bind_int64(ar_st, 2, (sqlite3_int64)rec->call_id);
+                sqlite3_bind_int64(ar_st, 3, (sqlite3_int64)ar_caller);
+                sqlite3_bind_int(ar_st, 4, ar->write_call_lineno);
+                sqlite3_bind_int(ar_st, 5, ar->read_call_lineno);
+                sqlite3_step(ar_st);
+                sqlite3_reset(ar_st);
+            }
+        }
+        sqlite3_finalize(call_st);
+        sqlite3_finalize(ar_st);
+    }
+
+    /* objects + members */
+    {
+        sqlite3_stmt *obj_st, *mem_st;
+        sqlite3_prepare_v2(sdb,
+            "INSERT INTO objects VALUES (?,?,?)", -1, &obj_st, NULL);
+        sqlite3_prepare_v2(sdb,
+            "INSERT INTO members VALUES (?,?,?,?)", -1, &mem_st, NULL);
+
+        for (Py_ssize_t i = 0; i < o->objects_len; i++) {
+            ObjectRecordData *obj = &o->objects[i];
+            sqlite3_bind_int(obj_st, 1, pid);
+            sqlite3_bind_int64(obj_st, 2, (sqlite3_int64)i);
+            sqlite3_bind_int64(obj_st, 3, (sqlite3_int64)obj->call_id);
+            sqlite3_step(obj_st);
+            sqlite3_reset(obj_st);
+
+            SMap *m = &obj->members;
+            if (m->entries) {
+                for (size_t k = 0; k < m->capacity; k++) {
+                    if (!m->entries[k].occupied) continue;
+                    sqlite3_bind_int(mem_st, 1, pid);
+                    sqlite3_bind_int64(mem_st, 2, (sqlite3_int64)i);
+                    sqlite3_bind_text(mem_st, 3, m->entries[k].key, -1, SQLITE_STATIC);
+                    sqlite3_bind_int64(mem_st, 4, (intptr_t)m->entries[k].value);
+                    sqlite3_step(mem_st);
+                    sqlite3_reset(mem_st);
+                }
+            }
+        }
+        sqlite3_finalize(obj_st);
+        sqlite3_finalize(mem_st);
+    }
+
+    /* ipc */
+    {
+        sqlite3_stmt *st;
+        sqlite3_prepare_v2(sdb,
+            "INSERT INTO ipc VALUES (?,?,?)", -1, &st, NULL);
+        for (Py_ssize_t i = 0; i < o->ipc_len; i++) {
+            IpcRecordData *entry = &o->ipc[i];
+            sqlite3_bind_int(st, 1, pid);
+            sqlite3_bind_text(st, 2, entry->name, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 3, (sqlite3_int64)entry->obj_idx);
+            sqlite3_step(st);
+            sqlite3_reset(st);
+        }
+        sqlite3_finalize(st);
+    }
+
+    if (exec_sql(sdb, "COMMIT") < 0)
+        goto fail;
+
+    sqlite3_close(sdb);
+
+    fprintf(stderr, "Trace written to %s (%zd calls, %zd objects, %zd ipc)\n",
+            path, o->calls_len, o->objects_len, o->ipc_len);
+    Py_RETURN_NONE;
+
+fail:
+    PyErr_Format(PyExc_RuntimeError, "serialize failed: %s", sqlite3_errmsg(sdb));
+    sqlite3_close(sdb);
+    return NULL;
 }
 
 static PyMethodDef Database_methods[] = {
-    {"add_call",   Database_add_call,   METH_O, NULL},
-    {"add_object", Database_add_object, METH_O, NULL},
-    {"add_ipc",    Database_add_ipc,    METH_O, NULL},
-    {"__reduce__", Database_reduce,     METH_NOARGS, NULL},
-    {NULL}
-};
-
-static PyMemberDef Database_members[] = {
-    {"calls",   Py_T_OBJECT_EX, offsetof(DatabaseObject, calls),   Py_READONLY, NULL},
-    {"objects", Py_T_OBJECT_EX, offsetof(DatabaseObject, objects), Py_READONLY, NULL},
-    {"ipc",     Py_T_OBJECT_EX, offsetof(DatabaseObject, ipc),     Py_READONLY, NULL},
+    {"add_ipc",    Database_add_ipc,    METH_VARARGS, NULL},
+    {"serialize",  Database_serialize,  METH_VARARGS, NULL},
     {NULL}
 };
 
 static PyType_Slot Database_slots[] = {
     {Py_tp_init,     Database_init},
     {Py_tp_dealloc,  Database_dealloc},
-    {Py_tp_traverse, Database_traverse},
-    {Py_tp_clear,    Database_clear},
     {Py_tp_methods,  Database_methods},
-    {Py_tp_members,  Database_members},
     {0, NULL}
 };
 
 static PyType_Spec Database_spec = {
     .name = "tracer._tracer.Database",
     .basicsize = sizeof(DatabaseObject),
-    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .flags = Py_TPFLAGS_DEFAULT,
     .slots = Database_slots,
 };
 
 /* ========== Module registration ========== */
 
 int records_init(PyObject *module) {
-#define REGISTER(Name, spec, typevar) do { \
-    typevar = (PyTypeObject *)PyType_FromSpec(&spec); \
-    if (!typevar) return -1; \
-    if (PyModule_AddObject(module, #Name, (PyObject *)typevar) < 0) { \
-        Py_DECREF(typevar); \
-        return -1; \
-    } \
-} while(0)
-
-    REGISTER(AttrRecordWrite, AttrRecordWrite_spec, AttrRecordWriteType);
-    REGISTER(AttrRecordRead,  AttrRecordRead_spec,  AttrRecordReadType);
-    REGISTER(CallRecord,      CallRecord_spec,      CallRecordType);
-    REGISTER(ObjectRecord,    ObjectRecord_spec,     ObjectRecordType);
-    REGISTER(IpcRecord,       IpcRecord_spec,        IpcRecordType);
-    REGISTER(Database,        Database_spec,          DatabaseType);
-
-#undef REGISTER
+    DatabaseType = (PyTypeObject *)PyType_FromSpec(&Database_spec);
+    if (!DatabaseType) return -1;
+    if (PyModule_AddObject(module, "Database", (PyObject *)DatabaseType) < 0) {
+        Py_DECREF(DatabaseType);
+        return -1;
+    }
     return 0;
 }

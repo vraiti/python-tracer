@@ -7,9 +7,9 @@
 extern PyObject *wrap_container(PyObject *value, PyObject *db, int obj_idx);
 
 /* forward declaration from hook.c */
-extern PyObject *py_current_record(PyObject *self, PyObject *args);
 extern uint64_t get_frame_call_id(PyFrameObject *frame);
 extern ObjectTraceData *get_trace_data(PyObject *obj);
+extern CallRecordData *current_record(void);
 
 /* ========== TracedSetattr ========== */
 
@@ -88,12 +88,11 @@ static PyObject *traced_setattr_call_impl(TracedSetattrObject *ts,
     ObjectTraceData *val_trace = get_trace_data(value);
     if (val_trace) {
         DatabaseObject *db = (DatabaseObject *)ts->db;
-        PyObject *obj_rec = PyList_GetItem(db->objects, (Py_ssize_t)trace_data->id);
-        if (obj_rec) {
-            ObjectRecordObject *orec = (ObjectRecordObject *)obj_rec;
-            PyObject *val_int = PyLong_FromUnsignedLongLong(val_trace->id);
-            PyDict_SetItem(orec->members, name, val_int);
-            Py_DECREF(val_int);
+        if ((Py_ssize_t)trace_data->id < db->objects_len) {
+            ObjectRecordData *orec = &db->objects[trace_data->id];
+            const char *name_str_m = PyUnicode_AsUTF8(name);
+            if (name_str_m)
+                SMap_set(&orec->members, name_str_m, (void *)(intptr_t)val_trace->id);
         }
     }
 
@@ -301,22 +300,9 @@ static PyObject *traced_getattr_call_impl(TracedGetattrObject *tg,
         uint64_t caller_id = get_frame_call_id(frame_ptr);
         int read_lineno = PyFrame_GetLineNumber(frame_ptr);
 
-        PyObject *rec = py_current_record(NULL, NULL);
-        if (rec && rec != Py_None) {
-            CallRecordObject *cr = (CallRecordObject *)rec;
-            PyObject *attr_read = PyObject_CallFunction(
-                (PyObject *)AttrRecordReadType,
-                "Kii", caller_id, arw.call_lineno, read_lineno);
-            if (attr_read) {
-                PyList_Append(cr->attr_reads, attr_read);
-                Py_DECREF(attr_read);
-            } else {
-                PyErr_Clear();
-            }
-            Py_DECREF(rec);
-        } else {
-            Py_XDECREF(rec);
-        }
+        CallRecordData *rec = current_record();
+        if (rec)
+            db_add_attr_read(rec, caller_id, arw.call_lineno, read_lineno);
     }
 
     return value;

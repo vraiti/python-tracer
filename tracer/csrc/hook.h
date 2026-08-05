@@ -30,7 +30,7 @@ typedef struct {
 /* Per-frame entry on the trace stack */
 typedef struct {
     uint64_t call_id;
-    PyObject *record;         /* CallRecordObject* (borrowed from db.calls list) */
+    CallRecordData *record;
     Bitset cf_bits;
     int32_t pending_cf;
     uint8_t *branch_buf;
@@ -69,9 +69,6 @@ typedef struct {
 
     /* Object extras: (uintptr_t)PyObject* -> (intptr_t)ObjectTraceData* */
     UMap object_extras;
-
-    /* Frame call_id map: (uintptr_t)_PyInterpreterFrame* -> (intptr_t)call_id */
-    UMap frame_call_ids;
 } TraceState;
 
 extern TraceState g_state;

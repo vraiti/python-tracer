@@ -3,75 +3,81 @@
 
 #include <Python.h>
 #include <stdint.h>
+#include "hashmap.h"
 
-/* ---- AttrRecordWrite ---- */
+/* ---- Plain C record structs (no PyObject_HEAD) ---- */
 
 typedef struct {
-    PyObject_HEAD
     uint64_t caller_id;
     int32_t call_lineno;
-} AttrRecordWriteObject;
-
-extern PyTypeObject *AttrRecordWriteType;
-
-/* ---- AttrRecordRead ---- */
+} AttrRecordWriteData;
 
 typedef struct {
-    PyObject_HEAD
     uint64_t caller_id;
     int32_t write_call_lineno;
     int32_t read_call_lineno;
-} AttrRecordReadObject;
-
-extern PyTypeObject *AttrRecordReadType;
-
-/* ---- CallRecord ---- */
+} AttrRecordReadData;
 
 typedef struct {
-    PyObject_HEAD
     uint64_t call_id;
     int32_t function_id;
     uint64_t caller_id;
     int32_t call_lineno;
     int32_t obj_id;
-    PyObject *control_flow;   /* bytearray */
-    PyObject *attr_reads;     /* list */
-} CallRecordObject;
-
-extern PyTypeObject *CallRecordType;
-
-/* ---- ObjectRecord ---- */
+    uint8_t *control_flow;
+    Py_ssize_t control_flow_len;
+    AttrRecordReadData *attr_reads;
+    Py_ssize_t attr_reads_len;
+    Py_ssize_t attr_reads_cap;
+} CallRecordData;
 
 typedef struct {
-    PyObject_HEAD
     uint64_t call_id;
-    PyObject *members;        /* dict */
-} ObjectRecordObject;
-
-extern PyTypeObject *ObjectRecordType;
-
-/* ---- IpcRecord ---- */
+    SMap members;
+} ObjectRecordData;
 
 typedef struct {
-    PyObject_HEAD
-    PyObject *name;           /* str */
+    char *name;
     int64_t obj_idx;
-} IpcRecordObject;
+} IpcRecordData;
 
-extern PyTypeObject *IpcRecordType;
-
-/* ---- Database ---- */
+/* ---- Database (Python type with C array storage) ---- */
 
 typedef struct {
     PyObject_HEAD
-    PyObject *calls;          /* list */
-    PyObject *objects;        /* list */
-    PyObject *ipc;            /* list */
+    CallRecordData *calls;
+    Py_ssize_t calls_len, calls_cap;
+    ObjectRecordData *objects;
+    Py_ssize_t objects_len, objects_cap;
+    IpcRecordData *ipc;
+    Py_ssize_t ipc_len, ipc_cap;
+    SMap arw_map;
 } DatabaseObject;
 
 extern PyTypeObject *DatabaseType;
 
-/* Register all record types on the module. Returns 0 on success, -1 on error. */
+/* ---- Database helpers ---- */
+
+CallRecordData *db_add_call(DatabaseObject *db,
+                            uint64_t call_id, int32_t function_id,
+                            uint64_t caller_id, int32_t call_lineno,
+                            int32_t obj_id);
+
+Py_ssize_t db_add_object(DatabaseObject *db, uint64_t call_id);
+
+void db_add_ipc_entry(DatabaseObject *db, const char *name, int64_t obj_idx);
+
+void db_add_attr_read(CallRecordData *rec,
+                      uint64_t caller_id,
+                      int32_t write_call_lineno,
+                      int32_t read_call_lineno);
+
+void db_set_arw(DatabaseObject *db, int32_t obj_id, const char *attr_name,
+                uint64_t caller_id, int32_t call_lineno);
+
+AttrRecordWriteData *db_get_arw(DatabaseObject *db, int32_t obj_id,
+                                const char *attr_name);
+
 int records_init(PyObject *module);
 
 #endif

@@ -44,6 +44,7 @@ int umap_contains(const UMap *m, uintptr_t key);
     void PREFIX##_free(PREFIX *m);                                      \
     int PREFIX##_get(const PREFIX *m, const char *key, VTYPE *out);     \
     void PREFIX##_set(PREFIX *m, const char *key, VTYPE value);         \
+    void PREFIX##_delete(PREFIX *m, const char *key);                   \
     int PREFIX##_contains(const PREFIX *m, const char *key);
 
 typedef struct {

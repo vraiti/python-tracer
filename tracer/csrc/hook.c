@@ -5,8 +5,21 @@
 #include <stdlib.h>
 #include <stddef.h>
 
+/* forward declarations */
+CallRecordData *current_record(void);
+
 /* forward declaration — implemented in ownership.c */
 extern void ownership_patch_class(PyObject *ownership, PyObject *cls);
+
+/* forward declarations — CPython hooks (typeobject.c, object.c, abstract.c, ceval.c) */
+extern void Set_object_new_hook(void (*hook)(PyObject *obj, PyTypeObject *type));
+extern void Set_PyObject_GenericGetAttr_hook(PyObject *(*hook)(PyObject *obj, PyObject *name, PyObject *result));
+extern void Set_PyObject_GenericSetAttr_hook(void (*hook)(PyObject *obj, PyObject *name, PyObject *value, int result));
+extern void Set_PyObject_GetItem_hook(PyObject *(*hook)(PyObject *o, PyObject *key, PyObject *result));
+extern void Set_PyObject_SetItem_hook(void (*hook)(PyObject *o, PyObject *key, PyObject *value, int result));
+extern void Set_PyGlobal_Store_hook(void (*hook)(PyObject *globals, PyObject *name, PyObject *value));
+extern void Set_PyGlobal_Load_hook(void (*hook)(PyObject *globals, PyObject *name, PyObject *value));
+extern void Set_PyGlobal_Delete_hook(void (*hook)(PyObject *globals, PyObject *name));
 
 TraceState g_state = {0};
 
@@ -15,14 +28,11 @@ TraceState g_state = {0};
 /* ---- frame call_id helpers ---- */
 
 void set_frame_call_id(PyFrameObject *frame, uint64_t cid) {
-    umap_set(&g_state.frame_call_ids, (uintptr_t)frame->f_frame, (intptr_t)cid);
+    frame->f_frame->call_id = cid;
 }
 
 uint64_t get_frame_call_id(PyFrameObject *frame) {
-    intptr_t val;
-    if (umap_get(&g_state.frame_call_ids, (uintptr_t)frame->f_frame, &val))
-        return (uint64_t)val;
-    return 0;
+    return frame->f_frame->call_id;
 }
 
 /* ---- object extras helpers ---- */
@@ -236,78 +246,67 @@ static int32_t get_obj_id(PyObject *self_obj) {
     return (int32_t)td->id;
 }
 
-static int is_tracked_class(PyObject *self_obj, PyCodeObject *code) {
+/* ---- is_tracked_type: check type without needing a code object ---- */
+
+static int is_tracked_type(PyTypeObject *type) {
     PathFilterObject *pf = (PathFilterObject *)g_state.filter;
     if (!pf) return 0;
 
-    /* Check if the __init__'s source file is under a traced prefix */
-    const char *filename = PyUnicode_AsUTF8(code->co_filename);
-    if (filename) {
-        for (Py_ssize_t i = 0; i < pf->prefix_count; i++) {
-            if (strncmp(filename, pf->prefixes[i], strlen(pf->prefixes[i])) == 0)
-                return 1;
-        }
-    }
-
-    /* Check explicit tracked_classes list */
-    PyObject *cls = (PyObject *)Py_TYPE(self_obj);
-    PyObject *module = PyObject_GetAttrString(cls, "__module__");
-    PyObject *qualname_attr = PyObject_GetAttrString(cls, "__qualname__");
-    int result = 0;
+    /* check explicit tracked_classes list */
+    PyObject *module = PyObject_GetAttrString((PyObject *)type, "__module__");
+    PyObject *qualname_attr = PyObject_GetAttrString((PyObject *)type, "__qualname__");
     if (module && qualname_attr) {
         const char *mod_str = PyUnicode_AsUTF8(module);
         const char *qual_str = PyUnicode_AsUTF8(qualname_attr);
         if (mod_str && qual_str) {
             char buf[512];
             snprintf(buf, sizeof(buf), "%s.%s", mod_str, qual_str);
-            result = SMap_contains(&pf->tracked_classes, buf);
+            if (SMap_contains(&pf->tracked_classes, buf)) {
+                Py_DECREF(module);
+                Py_DECREF(qualname_attr);
+                return 1;
+            }
         }
     }
     Py_XDECREF(module);
     Py_XDECREF(qualname_attr);
+
+    /* check if type.__init__'s source file is under a traced prefix */
+    PyObject *init = PyObject_GetAttrString((PyObject *)type, "__init__");
+    if (!init) { PyErr_Clear(); return 0; }
+    PyObject *code_obj = PyObject_GetAttrString(init, "__code__");
+    Py_DECREF(init);
+    if (!code_obj) { PyErr_Clear(); return 0; }
+
+    PyCodeObject *code = (PyCodeObject *)code_obj;
+    const char *filename = PyUnicode_AsUTF8(code->co_filename);
+    int result = 0;
+    if (filename) {
+        for (Py_ssize_t i = 0; i < pf->prefix_count; i++) {
+            if (strncmp(filename, pf->prefixes[i], strlen(pf->prefixes[i])) == 0) {
+                result = 1;
+                break;
+            }
+        }
+    }
+    Py_DECREF(code_obj);
     return result;
 }
 
-/* ---- handle_init: create ObjectRecord, attach trace data ---- */
+static uint64_t next_trace_data_id = 0;
 
-static void handle_init(PyObject *self_obj, PyCodeObject *code, uint64_t call_id) {
-    PyObject *cls = (PyObject *)Py_TYPE(self_obj);
-    if (!cls) return;
-
-    PyObject *cls_init = PyObject_GetAttrString(cls, "__init__");
-    if (!cls_init) { PyErr_Clear(); return; }
-    PyObject *cls_code = PyObject_GetAttrString(cls_init, "__code__");
-    Py_DECREF(cls_init);
-    if (!cls_code) { PyErr_Clear(); return; }
-
-    int matches = (PyCodeObject *)cls_code == code;
-    Py_DECREF(cls_code);
-    if (!matches) return;
-
-    /* create ObjectRecord and add to db */
-    DatabaseObject *db = (DatabaseObject *)g_state.db;
-    PyObject *obj_rec = PyObject_CallFunction((PyObject *)ObjectRecordType, "K", call_id);
-    if (!obj_rec) { PyErr_Clear(); return; }
-
-    Py_ssize_t obj_idx = PyList_GET_SIZE(db->objects);
-    if (PyList_Append(db->objects, obj_rec) < 0) {
-        Py_DECREF(obj_rec);
-        PyErr_Clear();
-        return;
-    }
-    Py_DECREF(obj_rec);
-
+static void attach_trace_data(PyObject *obj) {
     ObjectTraceData *trace_data = malloc(sizeof(ObjectTraceData));
-    trace_data->id = (uint64_t)obj_idx;
+    trace_data->id = next_trace_data_id++;
     ARWMap_init(&trace_data->attrs, 16);
     trace_data->type = CONTAINER_NONE;
-    umap_set(&g_state.object_extras, (uintptr_t)self_obj, (intptr_t)trace_data);
+    umap_set(&g_state.object_extras, (uintptr_t)obj, (intptr_t)trace_data);
 
     ExtraCleanupObject *ec = (ExtraCleanupObject *)PyObject_CallNoArgs(
         (PyObject *)ExtraCleanupType);
     if (ec) {
-        ec->obj_key = (uintptr_t)self_obj;
-        PyObject *weakref = PyWeakref_NewRef(self_obj, (PyObject *)ec);
+        ec->obj_key = (uintptr_t)obj;
+        PyObject *weakref = PyWeakref_NewRef(obj, (PyObject *)ec);
         Py_XDECREF(weakref);
         Py_DECREF(ec);
     } else {
@@ -315,10 +314,161 @@ static void handle_init(PyObject *self_obj, PyCodeObject *code, uint64_t call_id
     }
 }
 
+/* ---- object_new_hook: CPython hook called at end of object_new ---- */
+
+static void tracer_object_new_hook(PyObject *obj, PyTypeObject *type) {
+    if (!g_state.enabled) return;
+    if (get_trace_data(obj)) return;
+    if (!is_tracked_type(type)) return;
+
+    DatabaseObject *db = (DatabaseObject *)g_state.db;
+    db_add_object(db, 0);
+    attach_trace_data(obj);
+}
+
+/* ---- setattr hook: CPython hook called after PyObject_GenericSetAttr succeeds ---- */
+
+static void tracer_setattr_hook(PyObject *obj, PyObject *name, PyObject *value, int result) {
+    if (!g_state.enabled) return;
+
+    ObjectTraceData *td = get_trace_data(obj);
+    if (!td) return;
+
+    const char *name_str = PyUnicode_AsUTF8(name);
+    if (!name_str) return;
+
+    PyFrameObject *frame = PyEval_GetFrame();
+    if (!frame) return;
+
+    uint64_t caller_id = get_frame_call_id(frame);
+    int call_lineno = PyFrame_GetLineNumber(frame);
+    ARW arw = {caller_id, call_lineno};
+    ARWMap_set(&td->attrs, name_str, arw);
+
+    if (!value || Py_IS_PRIMITIVE(value)) return;
+
+    ObjectTraceData *val_td = get_trace_data(value);
+    if (val_td) {
+        DatabaseObject *db = (DatabaseObject *)g_state.db;
+        if ((Py_ssize_t)td->id < db->objects_len) {
+            ObjectRecordData *orec = &db->objects[td->id];
+            SMap_set(&orec->members, name_str, (void *)(intptr_t)val_td->id);
+        }
+    }
+}
+
+/* ---- getattr hook: CPython hook called after PyObject_GenericGetAttr succeeds ---- */
+
+static PyObject *tracer_getattr_hook(PyObject *obj, PyObject *name, PyObject *result) {
+    if (!g_state.enabled) return result;
+
+    const char *name_str = PyUnicode_AsUTF8(name);
+    if (!name_str) return result;
+
+    if (name_str[0] == '_' && name_str[1] == '_')
+        return result;
+
+    ObjectTraceData *td = get_trace_data(obj);
+    if (!td) return result;
+
+    ARW arw;
+    if (!ARWMap_get(&td->attrs, name_str, &arw))
+        return result;
+
+    PyFrameObject *frame = PyEval_GetFrame();
+    if (!frame) return result;
+
+    CallRecordData *rec = current_record();
+    if (rec) {
+        uint64_t caller_id = get_frame_call_id(frame);
+        int read_lineno = PyFrame_GetLineNumber(frame);
+        db_add_attr_read(rec, caller_id, arw.call_lineno, read_lineno);
+    }
+
+    return result;
+}
+
+/* ---- global variable hooks: treat f_globals as a tracked object ---- */
+
+static ObjectTraceData *get_or_create_globals_trace(PyObject *globals) {
+    ObjectTraceData *td = get_trace_data(globals);
+    if (td) return td;
+
+    DatabaseObject *db = (DatabaseObject *)g_state.db;
+    db_add_object(db, 0);
+    attach_trace_data(globals);
+    return get_trace_data(globals);
+}
+
+static void tracer_global_store_hook(PyObject *globals, PyObject *name, PyObject *value) {
+    if (!g_state.enabled) return;
+
+    ObjectTraceData *td = get_or_create_globals_trace(globals);
+    if (!td) return;
+
+    const char *name_str = PyUnicode_AsUTF8(name);
+    if (!name_str) return;
+
+    PyFrameObject *frame = PyEval_GetFrame();
+    if (!frame) return;
+
+    uint64_t caller_id = get_frame_call_id(frame);
+    int call_lineno = PyFrame_GetLineNumber(frame);
+    ARW arw = {caller_id, call_lineno};
+    ARWMap_set(&td->attrs, name_str, arw);
+
+    if (!value || Py_IS_PRIMITIVE(value)) return;
+
+    ObjectTraceData *val_td = get_trace_data(value);
+    if (val_td) {
+        DatabaseObject *db = (DatabaseObject *)g_state.db;
+        if ((Py_ssize_t)td->id < db->objects_len) {
+            ObjectRecordData *orec = &db->objects[td->id];
+            SMap_set(&orec->members, name_str, (void *)(intptr_t)val_td->id);
+        }
+    }
+}
+
+static void tracer_global_load_hook(PyObject *globals, PyObject *name, PyObject *value) {
+    if (!g_state.enabled) return;
+
+    const char *name_str = PyUnicode_AsUTF8(name);
+    if (!name_str) return;
+
+    ObjectTraceData *td = get_trace_data(globals);
+    if (!td) return;
+
+    ARW arw;
+    if (!ARWMap_get(&td->attrs, name_str, &arw))
+        return;
+
+    PyFrameObject *frame = PyEval_GetFrame();
+    if (!frame) return;
+
+    CallRecordData *rec = current_record();
+    if (rec) {
+        uint64_t caller_id = get_frame_call_id(frame);
+        int read_lineno = PyFrame_GetLineNumber(frame);
+        db_add_attr_read(rec, caller_id, arw.call_lineno, read_lineno);
+    }
+}
+
+static void tracer_global_delete_hook(PyObject *globals, PyObject *name) {
+    if (!g_state.enabled) return;
+
+    ObjectTraceData *td = get_trace_data(globals);
+    if (!td) return;
+
+    const char *name_str = PyUnicode_AsUTF8(name);
+    if (!name_str) return;
+
+    ARWMap_delete(&td->attrs, name_str);
+}
+
 /* ---- push a traced frame ---- */
 
 static void push_traced_frame(PyFrameObject *frame, uint64_t call_id,
-                              PyObject *record, const char *ref_str) {
+                              CallRecordData *record, const char *ref_str) {
     FrameEntry entry;
     entry.call_id = call_id;
     entry.record = record;
@@ -400,7 +550,7 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
         const char *name = PyUnicode_AsUTF8AndSize(co_name, &name_size);
         if (name && name_size == 8 && memcmp(name, "__init__", 8) == 0) {
             PyObject *self_obj = get_self_obj(py_frame, code);
-            if (self_obj && is_tracked_class(self_obj, code)) {
+            if (self_obj && get_trace_data(self_obj)) {
                 uint64_t call_id = g_state.next_call_id++;
                 uint64_t caller_id = 0;
                 int call_lineno = 0;
@@ -422,20 +572,11 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
                     ((PyFrameObject *)py_frame)->f_trace_lines = 1;
 
                     DatabaseObject *db = (DatabaseObject *)g_state.db;
-                    PyObject *rec = PyObject_CallFunction(
-                        (PyObject *)CallRecordType,
-                        "KiKii", call_id, function_id, caller_id, call_lineno, 0);
+                    CallRecordData *rec = db_add_call(db, call_id, function_id,
+                                                      caller_id, call_lineno, 0);
                     if (rec) {
-                        PyList_Append(db->calls, rec);
-
-                        handle_init(self_obj, code, call_id);
-                        int32_t obj_id = get_obj_id(self_obj);
-                        ((CallRecordObject *)rec)->obj_id = obj_id;
-
+                        rec->obj_id = get_obj_id(self_obj);
                         push_traced_frame(frame_obj, call_id, rec, ref_buf);
-                        Py_DECREF(rec);
-                    } else {
-                        PyErr_Clear();
                     }
                 }
             }
@@ -474,25 +615,11 @@ static int handle_call(PyObject *py_frame, PyFrameObject *frame_obj) {
     int32_t obj_id = get_obj_id(self_obj);
 
     DatabaseObject *db = (DatabaseObject *)g_state.db;
-    PyObject *rec = PyObject_CallFunction(
-        (PyObject *)CallRecordType,
-        "KiKii", call_id, function_id, caller_id, call_lineno, obj_id);
-    if (!rec) { PyErr_Clear(); Py_DECREF(code); return 0; }
-    PyList_Append(db->calls, rec);
-
-    /* __init__ handling for in-scope calls (tracked classes only) */
-    Py_ssize_t name_size;
-    const char *co_name_str = PyUnicode_AsUTF8AndSize(code->co_name, &name_size);
-    if (co_name_str && self_obj &&
-        name_size == 8 && memcmp(co_name_str, "__init__", 8) == 0 &&
-        is_tracked_class(self_obj, code)) {
-        handle_init(self_obj, code, call_id);
-        int32_t new_obj_id = get_obj_id(self_obj);
-        ((CallRecordObject *)rec)->obj_id = new_obj_id;
-    }
+    CallRecordData *rec = db_add_call(db, call_id, function_id,
+                                       caller_id, call_lineno, obj_id);
+    if (!rec) { Py_DECREF(code); return 0; }
 
     push_traced_frame(frame_obj, call_id, rec, ref_buf);
-    Py_DECREF(rec);
 
     ((PyFrameObject *)py_frame)->f_trace_lines = 1;
     Py_DECREF(code);
@@ -542,11 +669,11 @@ static int handle_return(PyObject *py_frame, PyFrameObject *frame_obj) {
 
         uint64_t entry_cid = entry->call_id;
 
-        if (entry->branch_len > 0) {
-            PyObject *ba = PyByteArray_FromStringAndSize(
-                (const char *)entry->branch_buf, entry->branch_len);
-            if (ba) {
-                ((CallRecordObject *)entry->record)->control_flow = ba;
+        if (entry->branch_len > 0 && entry->record) {
+            entry->record->control_flow = malloc(entry->branch_len);
+            if (entry->record->control_flow) {
+                memcpy(entry->record->control_flow, entry->branch_buf, entry->branch_len);
+                entry->record->control_flow_len = entry->branch_len;
             }
         }
 
@@ -848,7 +975,6 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
     }
     umap_free(&g_state.scope_cache);
     umap_free(&g_state.object_extras);
-    umap_free(&g_state.frame_call_ids);
 
     /* set up new state */
     Py_INCREF(hook);
@@ -870,7 +996,6 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
 
     umap_init(&g_state.scope_cache, 256);
     umap_init(&g_state.object_extras, 1024);
-    umap_init(&g_state.frame_call_ids, 1024);
 
     g_state.taint_patterns = NULL;
     g_state.taint_count = 0;
@@ -888,6 +1013,12 @@ static PyObject *py_install(PyObject *self, PyObject *args, PyObject *kw) {
     g_state.next_call_id = 1;
     g_state.enabled = 1;
 
+    Set_object_new_hook(tracer_object_new_hook);
+    Set_PyObject_GenericSetAttr_hook(tracer_setattr_hook);
+    Set_PyObject_GenericGetAttr_hook(tracer_getattr_hook);
+    Set_PyGlobal_Store_hook(tracer_global_store_hook);
+    Set_PyGlobal_Load_hook(tracer_global_load_hook);
+    Set_PyGlobal_Delete_hook(tracer_global_delete_hook);
     PyEval_SetTrace((Py_tracefunc)trace_func, g_state.hook_obj);
     PyEval_SetProfile((Py_tracefunc)profile_func, g_state.hook_obj);
     Py_RETURN_NONE;
@@ -905,6 +1036,12 @@ static PyObject *py_install_thread(PyObject *self, PyObject *Py_UNUSED(args)) {
 
 static PyObject *py_uninstall(PyObject *self, PyObject *Py_UNUSED(args)) {
     g_state.enabled = 0;
+    Set_object_new_hook(NULL);
+    Set_PyObject_GenericSetAttr_hook(NULL);
+    Set_PyObject_GenericGetAttr_hook(NULL);
+    Set_PyGlobal_Store_hook(NULL);
+    Set_PyGlobal_Load_hook(NULL);
+    Set_PyGlobal_Delete_hook(NULL);
     PyEval_SetTrace(NULL, NULL);
     PyEval_SetProfile(NULL, NULL);
     Py_RETURN_NONE;
@@ -924,12 +1061,11 @@ static PyObject *py_set_call_id(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
-PyObject *py_current_record(PyObject *self, PyObject *Py_UNUSED(args)) {
+CallRecordData *current_record(void) {
     PyFrameObject *frame = PyEval_GetFrame();
-    if (!frame) Py_RETURN_NONE;
+    if (!frame) return NULL;
     FrameEntry *entry = frame_stack_peek(frame);
-    if (!entry) Py_RETURN_NONE;
-    Py_INCREF(entry->record);
+    if (!entry) return NULL;
     return entry->record;
 }
 
@@ -1010,7 +1146,6 @@ static PyMethodDef hook_methods[] = {
     {"uninstall",      py_uninstall,                   METH_NOARGS, NULL},
     {"get_call_id",    py_get_call_id,                 METH_O, NULL},
     {"set_call_id",    (PyCFunction)py_set_call_id,    METH_VARARGS, NULL},
-    {"current_record", py_current_record,              METH_NOARGS, NULL},
     {"load_ast_data",  (PyCFunction)py_load_ast_data,  METH_VARARGS, NULL},
     {"get_func_map",   py_get_func_map,                METH_NOARGS, NULL},
     {NULL}

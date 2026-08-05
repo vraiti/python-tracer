@@ -192,6 +192,23 @@ void PREFIX##_set(PREFIX *m, const char *key, VTYPE value) {            \
     }                                                                   \
 }                                                                       \
                                                                         \
+void PREFIX##_delete(PREFIX *m, const char *key) {                      \
+    if (!m->entries || m->capacity == 0) return;                        \
+    size_t mask = m->capacity - 1;                                      \
+    size_t idx = strmap_hash(key) & mask;                               \
+    for (;;) {                                                          \
+        if (!m->entries[idx].occupied) return;                          \
+        if (strcmp(m->entries[idx].key, key) == 0) {                    \
+            free(m->entries[idx].key);                                  \
+            m->entries[idx].key = NULL;                                 \
+            m->entries[idx].occupied = 0;                               \
+            m->count--;                                                 \
+            return;                                                     \
+        }                                                               \
+        idx = (idx + 1) & mask;                                         \
+    }                                                                   \
+}                                                                       \
+                                                                        \
 int PREFIX##_contains(const PREFIX *m, const char *key) {               \
     VTYPE dummy;                                                        \
     return PREFIX##_get(m, key, &dummy);                                \
