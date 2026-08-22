@@ -4,3 +4,4 @@ traces
 **/__pycache__
 *.stamp
 *.egg-info
+venv

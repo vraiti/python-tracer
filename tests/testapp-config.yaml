@@ -1,6 +1,7 @@
 modules:
   - testapp
 classes:
-  - Engine
-  - Scheduler
-  - Task
+  - Payload
+  - Node
+taint-functions:
+  - scratch_noise

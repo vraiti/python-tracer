@@ -1,4 +1,3 @@
-import glob
 import os
 import shutil
 import sqlite3
@@ -38,10 +37,10 @@ def run_trace(output_dir):
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         raise RuntimeError(f"tracer exited with {result.returncode}")
-    dbs = sorted(glob.glob(os.path.join(output_dir, "*.db")))
-    if not dbs:
-        raise RuntimeError("no trace database produced")
-    return dbs[-1]
+    db_path = os.path.join(output_dir, "trace.db")
+    if not os.path.exists(db_path):
+        raise RuntimeError("no trace.db produced")
+    return db_path
 
 
 def normalize_ref(ref):
