@@ -167,7 +167,7 @@ calls(pid, call_id, function_id, caller_id, call_lineno, obj_id,
 attr_reads(pid, call_id, caller_id, write_call_lineno, read_call_lineno)
 objects(pid, obj_idx, call_id, PK(pid, obj_idx))
 members(pid, obj_idx, attr, child_idx)
-ipc(pid, name, obj_idx)
+ipc(pid, name, call_id)
 io_objects(pid, io_object_id, name, offset, PK(pid, io_object_id))
 io_ops(pid, io_object_id, call_id, offset, length, op_type)
 ```

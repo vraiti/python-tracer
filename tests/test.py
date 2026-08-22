@@ -18,7 +18,7 @@ TABLES = [
     ("attr_reads", "SELECT call_id, caller_id, write_call_lineno, read_call_lineno FROM attr_reads ORDER BY call_id, caller_id, write_call_lineno, read_call_lineno"),
     ("objects", "SELECT obj_idx, call_id FROM objects ORDER BY obj_idx"),
     ("members", "SELECT obj_idx, attr, child_idx FROM members ORDER BY obj_idx, attr"),
-    ("ipc", "SELECT name, obj_idx FROM ipc ORDER BY name"),
+    ("ipc", "SELECT name, call_id FROM ipc ORDER BY name"),
 ]
 
 
