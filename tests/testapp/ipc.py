@@ -82,3 +82,12 @@ def exchange():
     shm.unlink()
     srv.close()
     return out
+
+
+def terminate():
+    """End the process by a SIG_DFL signal. The tracer substitutes its own
+    handler for the kernel's default disposition but must stay invisible
+    to the program; the trace must still contain every call active here."""
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+    os.kill(os.getpid(), signal.SIGTERM)                        # SIG_DFL
+    raise AssertionError("survived SIGTERM")

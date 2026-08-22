@@ -9,6 +9,7 @@ source so that the checks survive unrelated changes in ids and ordering.
 """
 
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -37,19 +38,23 @@ def run_trace(output_dir):
         [CPYTHON, "-m", "d3g", "--", SCRIPT],
         cwd=ROOT, env=env, capture_output=True, text=True,
     )
-    if result.returncode != 0:
+    # The application ends itself with SIGTERM under SIG_DFL; the tracer must
+    # preserve the default action (death by signal) after flushing.
+    if result.returncode != -signal.SIGTERM:
         print(result.stderr, file=sys.stderr)
-        raise RuntimeError(f"tracer exited with {result.returncode}")
-    db_path = os.path.join(output_dir, "trace.db")
-    if not os.path.exists(db_path):
-        raise RuntimeError("no trace.db produced")
+        raise RuntimeError(f"tracer exited with {result.returncode}, expected -SIGTERM")
+    # The runner leaves one {pid}.db per process; postprocess merges the
+    # directory into trace.db offline and then builds the dependency graph.
     result = subprocess.run(
-        [CPYTHON, "-m", "d3g.postprocess", db_path],
+        [CPYTHON, "-m", "d3g.postprocess", output_dir],
         cwd=ROOT, capture_output=True, text=True,
     )
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
         raise RuntimeError(f"postprocess exited with {result.returncode}")
+    db_path = os.path.join(output_dir, "trace.db")
+    if not os.path.exists(db_path):
+        raise RuntimeError("no trace.db produced")
     return db_path
 
 
@@ -160,6 +165,10 @@ def check_trace(db_path):
     expect(len(adds) == 4, f"expected 4 add() calls, got {len(adds)}")
     expect(len(t.calls_of("core.py:Node.__init__", parent)) == 2, "expected 2 Node.__init__ calls")
     expect(len(t.calls_of("ipc.py:_on_usr1", parent)) == 1, "signal handler was not traced")
+    # terminate(), main() and <module> are still active when SIGTERM arrives;
+    # they reach the database only through the SIG_DFL flush.
+    terminate = t.one_call("ipc.py:terminate", parent)
+    expect(terminate[2] == main[1], "terminate() is not called from main()")
 
     # The child inherits the calls active at fork and no others.
     child_refs = sorted(ref.rsplit("/", 1)[-1] for (p, _), (ref, *_rest) in t.calls.items() if p == child)

@@ -1,5 +1,5 @@
 from testapp.core import run
-from testapp.ipc import exchange
+from testapp.ipc import exchange, terminate
 
 
 def main():
@@ -7,6 +7,7 @@ def main():
     results.update(exchange())
     for key, value in results.items():
         print(f"  {key}: {value}")
+    terminate()
 
 
 if __name__ == "__main__":
