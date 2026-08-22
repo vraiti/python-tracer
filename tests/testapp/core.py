@@ -70,6 +70,25 @@ def safe_div(a, b):
         return None
 
 
+async def ticks(n):
+    for i in range(n):
+        yield i
+
+
+async def consume(n, flag):
+    """Control flow the statement skeleton cannot replay: a compound
+    condition, a ternary, an inlined comprehension and an async for."""
+    kind = "some" if n > 1 else "none"
+    squares = [i * i for i in range(n) if i % 2 == 0]
+    acc = 0
+    async for i in ticks(n):
+        if flag and i % 2 == 1:
+            acc += i
+        else:
+            acc -= 1
+    return {"kind": kind, "squares": squares, "acc": acc}
+
+
 def run():
     global counter, transient
 
@@ -94,7 +113,11 @@ def run():
     transient = safe_div(1, 0)
     del transient
 
+    import asyncio
+    consumed = asyncio.run(consume(4, True))
+
     return {
+        "consumed": consumed,
         "drained": shared.drain(),
         "sign": shared.meta["sign"],
         "acc": acc(0),

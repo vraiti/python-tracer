@@ -222,6 +222,15 @@ def check_trace(db_path):
     expect(t.executed(parent, drain[1]).count(body) == 5,
            "drain's while loop did not replay 5 iterations (4 traced records + 1 from the excluded call)")
 
+    # Bytecode-level replay: the compound condition, ternary and
+    # comprehension emit branch bytes of their own, and `async for` is
+    # driven by the GET_ANEXT/END_ASYNC_FOR bytes.
+    consume = t.one_call("core.py:consume", parent)
+    consume_lines = t.executed(parent, consume[1])
+    expect(consume_lines.count(L("acc += i")) == 2 and consume_lines.count(L("acc -= 1")) == 2,
+           f"consume(): async for body did not replay 4 iterations with 2 per branch: {consume_lines}")
+    expect(L('return {"kind": kind') in consume_lines, "consume(): return statement not replayed")
+
     safe_div = t.one_call("core.py:safe_div", parent)
     expect(L("return a / b") in t.executed(parent, safe_div[1]), "safe_div try body not replayed")
 
@@ -257,6 +266,15 @@ def check_trace(db_path):
             (L("other.peer = self"), L("left.peer.peer is left"))} <= run_ar,
            "run(): peer reads are not linked to the writes in Node.link")
 
+    # `shared = Payload(...)` binds shared to the constructor call's result;
+    # `shared.record(value)` then receives it as `self`.
+    init_call = t.one_call("core.py:Payload.__init__", parent)[1]
+    self_edges = {(src, tgt) for src, tgt in t.q(
+        "SELECT source_call_id, target_call_id FROM dataflow_edges WHERE pid = ? "
+        "AND source_type = 'call_result' AND target_type = 'arg' AND target_name = 'self'", parent)}
+    expect(all((init_call, cid) in self_edges for _, cid, _, _ in from_run),
+           "run(): record() calls do not receive shared as the result of Payload()")
+
     # Module global written at import, read in run().
     expect((L("counter = 0"), L("counter += 1")) in run_ar,
            "run(): first read of global counter is not linked to its module-level definition")
@@ -274,7 +292,13 @@ def check_trace(db_path):
         expect((parent, child, channel) in edges and (child, parent, channel) in edges,
                f"no bidirectional cross-process edge for {channel}")
 
-    for suffix in ("/map", "/data", "/fifo"):
+    # Shared-memory traffic goes through SharedMemory.buf (a memoryview over
+    # the mmap), so the ops come from the memoryview hooks; the write in the
+    # child and the overlapping read in the parent are paired into an io edge.
+    expect(any(src == child and dst == parent and name == "io" for src, dst, name in edges),
+           "no child->parent io edge for the shared-memory write/read pair")
+
+    for suffix in ("/map", "/data", "/fifo", "/psm_%"):
         ops = {}
         for pid, op in t.q(
                 "SELECT o.pid, p.op_type FROM io_ops p JOIN io_objects o "
