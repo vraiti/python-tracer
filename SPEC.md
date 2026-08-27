@@ -65,8 +65,8 @@ Paths are relative to `cpython/` unless stated otherwise.
 | `Lib/d3g/_bootstrap.py` | Config load, `PathFilter`/`Database` construction, `_tracer.install()`; patches `threading.Thread.run` to call `install_thread()` |
 | `Lib/d3g/__main__.py` | `python -m d3g -- script.py [args]` entry point; runs the script and calls `uninstall()` in a `finally` |
 | `Lib/d3g/postprocess.py` | Offline merge of per-process traces into `trace.db`, then AST-based dependency-graph reconstruction |
-| `../tests/test.py`, `../tests/testapp/`, `../tests/testapp-config.yaml` | End-to-end test (§13) |
-| `../configs/*.yaml`, `../scripts/*.sh` | Configurations and helper scripts for tracing a vLLM-Omni server (§13) |
+| `../tests/test.py`, `../tests/testapp/`, `../tests/testapp-config.json` | End-to-end test (§13) |
+| `../configs/*.json`, `../scripts/*.sh` | Configurations and helper scripts for tracing a vLLM-Omni server (§13) |
 
 `Modules/_tracer/` is built into the interpreter as a `*static*` entry in
 `Modules/Setup.bootstrap.in` (linked with `-lsqlite3`). The tree is
@@ -154,7 +154,7 @@ frame. Writes to tracked objects made inside an excluded subtree are still
 observed by the object, but attributed to caller 0 when serialized
 (`writer.c`), so a later read depends on "an untraced writer" rather than
 on the excluded call. The test application exercises this with
-`scratch_noise` (`tests/testapp-config.yaml`).
+`scratch_noise` (`tests/testapp-config.json`).
 
 ## 7. Container-Instance Tracking
 
@@ -366,7 +366,7 @@ directory, `merge_traces()` runs first and `postprocess()` then runs on
 ### 13.1 End-to-end test
 
 `tests/test.py` runs `tests/testapp/main.py` under
-`cpython/python -m d3g` with `tests/testapp-config.yaml`, postprocesses the
+`cpython/python -m d3g` with `tests/testapp-config.json`, postprocesses the
 output directory, and asserts structural properties of `trace.db` derived
 from the application's source (no baseline database). `testapp` covers:
 
@@ -385,13 +385,13 @@ Run: `cpython/python tests/test.py` (prints `PASS`).
 ### 13.2 Tracing an application
 
 ```
-PYTHON_TRACER_CONFIG=configs/vllm-omni.yaml PYTHON_TRACER_OUTDIR=traces/vllm-omni \
+PYTHON_TRACER_CONFIG=configs/vllm-omni.json PYTHON_TRACER_OUTDIR=traces/vllm-omni \
   python -m d3g -- $(which vllm) serve tiny-random/Qwen-Image --omni --port 8000 --enforce-eager
 python -m d3g.postprocess traces/vllm-omni
 ```
 
-`configs/vllm-omni.yaml` traces the `vllm` and `vllm_omni` packages;
-`configs/vllm-omni-traceall.yaml` sets `traceall: true`.
+`configs/vllm-omni.json` traces the `vllm` and `vllm_omni` packages;
+`configs/vllm-omni-traceall.json` sets `traceall: true`.
 `scripts/poll-health-pid.sh` waits for the server's `/health` endpoint (or
 its death) and `scripts/query-qwen-image.sh` issues one text-to-image
 request.

@@ -18,7 +18,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CPYTHON = os.path.join(ROOT, "cpython", "python")
 TESTS = os.path.join(ROOT, "tests")
-CONFIG = os.path.join(TESTS, "testapp-config.yaml")
+CONFIG = os.path.join(TESTS, "testapp-config.json")
 SCRIPT = os.path.join(TESTS, "testapp", "main.py")
 CORE = os.path.join(TESTS, "testapp", "core.py")
 

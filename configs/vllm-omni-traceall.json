@@ -1,0 +1,4 @@
+{
+  "_comment": "Trace every call in every process. Usage: PYTHON_TRACER_CONFIG=configs/vllm-omni-traceall.json PYTHON_TRACER_OUTDIR=traces/vllm-omni-traceall python -m d3g -- $(which vllm) serve tiny-random/Qwen-Image --omni --port 8000 --enforce-eager",
+  "traceall": true
+}

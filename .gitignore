@@ -5,3 +5,4 @@ traces
 *.stamp
 *.egg-info
 venv
+build

@@ -1,7 +1,0 @@
-modules:
-  - testapp
-classes:
-  - Payload
-  - Node
-taint-functions:
-  - scratch_noise

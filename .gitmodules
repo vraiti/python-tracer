@@ -1,4 +1,4 @@
 [submodule "cpython"]
 	path = cpython
 	url = https://github.com/vraiti/cpython.git
-	branch = main
+	branch = d3g-3.14
