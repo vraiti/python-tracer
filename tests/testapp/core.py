@@ -58,6 +58,30 @@ def make_accumulator():
     return add
 
 
+async def describe(tag):
+    return "cell:" + tag
+
+
+async def relay(fn):
+    return await fn()               # indirect call of a received closure
+
+
+def make_task(tag):
+    # `tag` is a captured parameter: it enters its cell via MAKE_CELL,
+    # never through STORE_DEREF.
+    return lambda: describe(tag)
+
+
+def decoy():
+    return "-decoy"
+
+
+async def relay_arg(fn):
+    # `decoy()` executes (and is recorded) before the lambda, so pairing
+    # `fn` with its child requires identity, not queue position.
+    return await fn(decoy())
+
+
 def scratch_noise(payload):
     """Excluded via taint-functions; nothing beneath this call is traced."""
     payload.record(99)
@@ -68,6 +92,22 @@ def safe_div(a, b):
         return a / b
     except ZeroDivisionError:
         return None
+
+
+def poll(attempts):
+    """A handler entered on some iterations: exception-driven control flow
+    the replay has to follow through the recorded handler entries."""
+    got = 0
+    for i in range(attempts):
+        try:
+            got += safe_index([0, 1], i)
+        except IndexError:
+            got -= 1
+    return got
+
+
+def safe_index(seq, i):
+    return seq[i]
 
 
 async def ticks(n):
@@ -112,12 +152,17 @@ def run():
     scratch_noise(shared)
     transient = safe_div(1, 0)
     del transient
+    polled = poll(4)
 
     import asyncio
     consumed = asyncio.run(consume(4, True))
+    described = asyncio.run(relay(make_task("qi")))
+    suffixed = asyncio.run(relay_arg(lambda s: describe("arg" + s)))
 
     return {
         "consumed": consumed,
+        "described": described,
+        "polled": polled,
         "drained": shared.drain(),
         "sign": shared.meta["sign"],
         "acc": acc(0),

@@ -1,7 +1,7 @@
 //! Per-call replay and intra-call dataflow resolution.
 
 use crate::ast::{Def, Expr, Stmt, StmtKind, Target};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,10 +63,13 @@ pub struct Edge {
 pub struct CallInfo {
     pub pid: i64,
     pub call_id: i64,
+    pub function_id: i64,
     pub call_lineno: i64,
     pub obj_id: i64,
     pub control_flow: Option<Vec<u8>>,
     pub ref_: String,
+    /// Trace id of the function object this call executed (0 if untracked).
+    pub func_idx: i64,
 }
 
 pub struct AttrRead {
@@ -89,11 +92,15 @@ pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> 
         for s in stmts {
             by_line.entry(s.l).or_default().push(s);
             match &s.kind {
-                StmtKind::For { b, e, .. } | StmtKind::While { b, e } | StmtKind::If { b, e } => {
+                StmtKind::For { b, e, .. } | StmtKind::While { b, e, .. } | StmtKind::If { b, e, .. } => {
                     index(b, by_line);
                     index(e, by_line);
                 }
-                StmtKind::With { b } | StmtKind::Try { b } => index(b, by_line),
+                StmtKind::With { b } => index(b, by_line),
+                StmtKind::Try { b, h } => {
+                    index(b, by_line);
+                    index(h, by_line);
+                }
                 _ => {}
             }
         }
@@ -101,6 +108,19 @@ pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> 
     let mut by_line: HashMap<i64, Vec<&'a Stmt>> = HashMap::new();
     index(body, &mut by_line);
 
+    // Handler entry nodes (kind 7) keyed by the code-unit offset the tracer
+    // records (3 + u32) when an exception transfers control there.
+    let handlers: HashMap<i64, usize> =
+        cfg.iter().enumerate().filter(|(_, n)| n.1 == 7).map(|(i, n)| (n.2, i)).collect();
+    let handler_jump = |pos: &mut usize| -> Option<usize> {
+        if blob.get(*pos) != Some(&3) || *pos + 5 > blob.len() {
+            return None;
+        }
+        let b = &blob[*pos + 1..*pos + 5];
+        let off = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64;
+        *pos += 5;
+        handlers.get(&off).copied()
+    };
     let mut out: Vec<&'a Stmt> = Vec::new();
     let mut pos = 0usize;
     let mut idx = 0usize;
@@ -123,13 +143,24 @@ pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> 
             last_line = line;
         }
         let jump = |taken: bool, idx: usize| if taken { target as usize } else { idx + 1 };
+        // An exception raised since the last consumed byte shows up as a
+        // handler entry wherever the walk next needs a byte.
+        if blob.get(pos) == Some(&3) && matches!(kind, 1 | 2 | 5 | 6) {
+            match handler_jump(&mut pos) {
+                Some(h) => {
+                    idx = h;
+                    continue;
+                }
+                None => break,
+            }
+        }
         idx = match kind {
             1 | 2 => match blob.get(pos) {
-                Some(&b) => {
+                Some(&b) if b <= 1 => {
                     pos += 1;
                     jump(b == 1, idx)
                 }
-                None => break,
+                _ => break,
             },
             3 => {
                 let t = target as usize;
@@ -143,7 +174,7 @@ pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> 
             }
             4 => target as usize,
             5 => {
-                if blob.get(pos).is_none() {
+                if blob.get(pos) != Some(&0) {
                     break;
                 }
                 pos += 1;
@@ -187,7 +218,7 @@ pub fn reconstruct<'a>(body: &'a [Stmt], blob: &[u8]) -> Vec<&'a Stmt> {
             for stmt in stmts {
                 self.out.push(stmt);
                 match &stmt.kind {
-                    StmtKind::For { b, e, .. } | StmtKind::While { b, e } => {
+                    StmtKind::For { b, e, .. } | StmtKind::While { b, e, .. } => {
                         while self.consume() == Some(0) {
                             self.walk(b);
                         }
@@ -195,7 +226,7 @@ pub fn reconstruct<'a>(body: &'a [Stmt], blob: &[u8]) -> Vec<&'a Stmt> {
                             self.walk(e);
                         }
                     }
-                    StmtKind::If { b, e } => {
+                    StmtKind::If { b, e, .. } => {
                         let decision = self.consume();
                         if decision == Some(0) {
                             self.walk(b);
@@ -203,7 +234,7 @@ pub fn reconstruct<'a>(body: &'a [Stmt], blob: &[u8]) -> Vec<&'a Stmt> {
                             self.walk(e);
                         }
                     }
-                    StmtKind::With { b } | StmtKind::Try { b } => self.walk(b),
+                    StmtKind::With { b } | StmtKind::Try { b, .. } => self.walk(b),
                     _ => {}
                 }
             }
@@ -220,6 +251,38 @@ struct ValueSource {
     call_id: i64,
     member_path: Option<String>,
     sources: Vec<Rc<ValueSource>>,
+}
+
+/// Leaves kept per composite value. A loop that folds call results into an
+/// accumulator would otherwise grow the source set without bound (and the
+/// edges emitted per use with it); the earliest sources are kept.
+const MAX_COMPOSITE_LEAVES: usize = 256;
+
+/// A value derived from several sources. Composites are kept flat -- a
+/// deduplicated set of non-composite leaves -- so that `emit_edge` costs
+/// one edge per leaf rather than one per path through the derivation
+/// history, which is exponential for `x = f(x, x)`-style loops.
+fn composite(name: String, parts: Vec<Rc<ValueSource>>) -> Rc<ValueSource> {
+    let mut seen: HashSet<*const ValueSource> = HashSet::new();
+    let mut leaves: Vec<Rc<ValueSource>> = Vec::new();
+    let mut push = |src: &Rc<ValueSource>, leaves: &mut Vec<Rc<ValueSource>>| {
+        if leaves.len() < MAX_COMPOSITE_LEAVES && seen.insert(Rc::as_ptr(src)) {
+            leaves.push(src.clone());
+        }
+    };
+    for part in &parts {
+        if part.kind == Kind::Composite {
+            for leaf in &part.sources {
+                push(leaf, &mut leaves);
+            }
+        } else {
+            push(part, &mut leaves);
+        }
+    }
+    if leaves.len() == 1 {
+        return leaves.pop().unwrap();
+    }
+    Rc::new(ValueSource { kind: Kind::Composite, name, call_id: 0, member_path: None, sources: leaves })
 }
 
 fn literal(name: impl Into<String>) -> Rc<ValueSource> {
@@ -240,9 +303,14 @@ struct Resolver<'a> {
     /// the replay reaches consumes the next one, so repeated executions of
     /// a line (loops) map onto successive children.
     child_queues: HashMap<i64, VecDeque<&'a CallInfo>>,
-    /// The child most recently consumed on each line; the value a call
-    /// expression produced.
-    child_current: HashMap<i64, &'a CallInfo>,
+    /// The child each call expression consumed, keyed by the expression
+    /// node's address: several call expressions share a line (`f(g())`),
+    /// so a line-keyed slot would be clobbered by the outer call before
+    /// the inner one's value is read.
+    child_current: HashMap<usize, &'a CallInfo>,
+    /// Callable parameters of this call: name -> trace id of the function
+    /// object the parameter held (from call_args).
+    arg_funcs: &'a HashMap<String, i64>,
     edges: Vec<Edge>,
 }
 
@@ -279,13 +347,15 @@ impl<'a> Resolver<'a> {
                     literal("?")
                 }
             }
-            Expr::Call { l, .. } if self.child_current.contains_key(l) => {
+            Expr::Call { .. }
+                if self.child_current.contains_key(&(expr as *const Expr as usize)) =>
+            {
                 // The value is whatever the traced child call returned; its
                 // provenance continues through that call's own `return` edges.
                 Rc::new(ValueSource {
                     kind: Kind::CallResult,
                     name: "return".to_string(),
-                    call_id: self.child_current[l].call_id,
+                    call_id: self.child_current[&(expr as *const Expr as usize)].call_id,
                     member_path: None,
                     sources: Vec::new(),
                 })
@@ -296,16 +366,32 @@ impl<'a> Resolver<'a> {
                 match sources.len() {
                     1 => sources.into_iter().next().unwrap(),
                     0 => literal("<expr>"),
-                    _ => Rc::new(ValueSource {
-                        kind: Kind::Composite,
-                        name: nm.join(","),
-                        call_id: 0,
-                        member_path: None,
-                        sources,
-                    }),
+                    _ => composite(nm.join(","), sources),
                 }
             }
         }
+    }
+
+    /// A value computed on `lineno` also depends on any attribute or
+    /// container read the tracer recorded there (e.g. a C-level
+    /// `self.queue.popleft()`), whose writer the resolver cannot see in the
+    /// expression itself.
+    fn with_line_reads(&self, src: Rc<ValueSource>, lineno: i64, consumed: bool) -> Rc<ValueSource> {
+        if consumed {
+            return src;
+        }
+        let Some(ar) = self.ar_by_line.get(&lineno) else { return src };
+        let read = Rc::new(ValueSource {
+            kind: Kind::AttrRead,
+            name: "<read>".to_string(),
+            call_id: ar.caller_id,
+            member_path: None,
+            sources: Vec::new(),
+        });
+        if src.kind == Kind::Literal {
+            return read;
+        }
+        composite("<read>".to_string(), vec![src, read])
     }
 
     fn emit_edge(&mut self, src: &Rc<ValueSource>, target_call_id: i64, target_type: TargetType, target_name: &str) {
@@ -352,21 +438,27 @@ impl<'a> Resolver<'a> {
     /// Take the traced child on `lineno` that this call expression made.
     /// Several traced calls can share a line (attribute protocol, generator
     /// bookkeeping, the call itself), so prefer the first whose qualname
-    /// matches the callee; otherwise the first that is not an attribute
+    /// matches the callee; failing that, a callee that names a callable
+    /// parameter of this call is matched to the child that executed exactly
+    /// that function object; otherwise the first that is not an attribute
     /// protocol method.
     fn take_child(&mut self, lineno: i64, callee: Option<&str>) -> Option<&'a CallInfo> {
+        let identity = callee.and_then(|f| self.arg_funcs.get(f)).copied();
         let q = self.child_queues.get_mut(&lineno)?;
         let pos = callee
             .and_then(|f| q.iter().position(|c| callee_matches(&c.ref_, f)))
+            .or_else(|| {
+                identity.and_then(|idx| q.iter().position(|c| c.func_idx == idx))
+            })
             .or_else(|| q.iter().position(|c| !is_attr_protocol(&c.ref_)))?;
         let child = q.remove(pos)?;
-        self.child_current.insert(lineno, child);
         Some(child)
     }
 
     fn process_call_expr(&mut self, expr: &Expr, lineno: i64) {
         let Expr::Call { f, o, a, kw, .. } = expr else { return };
         let Some(child) = self.take_child(lineno, f.as_deref()) else { return };
+        self.child_current.insert(expr as *const Expr as usize, child);
         let child_id = child.call_id;
         if let Some(obj) = o {
             if let Some(src) = self.symbols.get(obj).cloned() {
@@ -375,14 +467,23 @@ impl<'a> Resolver<'a> {
         }
         for (i, arg) in a.iter().enumerate() {
             let src = self.source_from_expr(arg);
+            let src = self.with_line_reads(src, lineno, uses_attr_read(arg));
             self.emit_edge(&src, child_id, TargetType::Arg, &format!("arg{i}"));
         }
         for (name, value) in kw {
             let src = self.source_from_expr(value);
+            let src = self.with_line_reads(src, lineno, uses_attr_read(value));
             let name = name.as_deref().unwrap_or("**kwargs");
             self.emit_edge(&src, child_id, TargetType::Arg, name);
         }
     }
+}
+
+/// Whether `source_from_expr` already consults the line's attr_read for
+/// this expression (a bare attribute chain does; calls and other
+/// expressions do not).
+fn uses_attr_read(e: &Expr) -> bool {
+    matches!(e, Expr::Attr { c: Some(_), .. })
 }
 
 fn qualname_parts(ref_: &str) -> impl Iterator<Item = &str> {
@@ -415,6 +516,7 @@ pub fn resolve_intra_call<'a>(
     executed: &[&Stmt],
     child_calls: &[&'a CallInfo],
     attr_reads: &'a [AttrRead],
+    arg_funcs: &'a HashMap<String, i64>,
 ) -> Vec<Edge> {
     let mut r = Resolver {
         call,
@@ -422,6 +524,7 @@ pub fn resolve_intra_call<'a>(
         ar_by_line: HashMap::new(),
         child_queues: HashMap::new(),
         child_current: HashMap::new(),
+        arg_funcs,
         edges: Vec::new(),
     };
     for p in &func.p {
@@ -449,6 +552,7 @@ pub fn resolve_intra_call<'a>(
             StmtKind::Assign { tg, v } => {
                 r.process_calls(v);
                 let src = r.source_from_expr(v);
+                let src = r.with_line_reads(src, stmt.l, uses_attr_read(v));
                 for t in tg {
                     match t {
                         Target::Name { id } => {
@@ -465,6 +569,7 @@ pub fn resolve_intra_call<'a>(
             StmtKind::AnnAssign { tg, v: Some(v) } => {
                 r.process_calls(v);
                 let src = r.source_from_expr(v);
+                let src = r.with_line_reads(src, stmt.l, uses_attr_read(v));
                 if let Some(id) = tg {
                     r.symbols.insert(id.clone(), src);
                 }
@@ -473,14 +578,9 @@ pub fn resolve_intra_call<'a>(
                 r.process_calls(v);
                 let old = r.symbols.get(id).cloned();
                 let new_src = r.source_from_expr(v);
+                let new_src = r.with_line_reads(new_src, stmt.l, uses_attr_read(v));
                 let merged = match old {
-                    Some(old) => Rc::new(ValueSource {
-                        kind: Kind::Composite,
-                        name: id.clone(),
-                        call_id: 0,
-                        member_path: None,
-                        sources: vec![old, new_src],
-                    }),
+                    Some(old) => composite(id.clone(), vec![old, new_src]),
                     None => new_src,
                 };
                 r.symbols.insert(id.clone(), merged);
@@ -488,9 +588,12 @@ pub fn resolve_intra_call<'a>(
             StmtKind::Return { v: Some(v) } => {
                 r.process_calls(v);
                 let src = r.source_from_expr(v);
+                let src = r.with_line_reads(src, stmt.l, uses_attr_read(v));
                 r.emit_edge(&src, call.call_id, TargetType::Return, "return");
             }
             StmtKind::ExprCall { v } => r.process_calls(v),
+            // Calls in a condition are evaluated like any other call.
+            StmtKind::If { t, .. } | StmtKind::While { t, .. } => r.process_calls(t),
             _ => {}
         }
 
@@ -499,16 +602,18 @@ pub fn resolve_intra_call<'a>(
             // loop target derives from what it produced.
             r.process_calls(it);
             let iter_src = r.source_from_expr(it);
-            r.symbols.insert(
-                id.clone(),
+            let bound = if iter_src.kind == Kind::Composite {
+                composite(id.clone(), iter_src.sources.clone())
+            } else {
                 Rc::new(ValueSource {
                     kind: iter_src.kind,
                     name: id.clone(),
                     call_id: iter_src.call_id,
                     member_path: iter_src.member_path.clone(),
-                    sources: vec![iter_src],
-                }),
-            );
+                    sources: Vec::new(),
+                })
+            };
+            r.symbols.insert(id.clone(), bound);
         }
     }
     r.edges

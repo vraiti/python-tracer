@@ -231,6 +231,73 @@ def check_trace(db_path):
            f"consume(): async for body did not replay 4 iterations with 2 per branch: {consume_lines}")
     expect(L('return {"kind": kind') in consume_lines, "consume(): return statement not replayed")
 
+    # Captured parameter: make_task's `tag` enters its cell via MAKE_CELL and
+    # is read back by the lambda body (LOAD_DEREF) in a different frame.
+    lam = t.one_call("make_task.<locals>.<lambda>", parent)
+    lam_reads = t.attr_reads(parent, lam[1])
+    expect(any(r == L("return lambda: describe(tag)") for (_w, r) in lam_reads),
+           f"lambda did not record a cell read of its captured parameter: {lam_reads}")
+
+    # Callable identity: relay's `fn` parameter held the lambda's function
+    # object, so `await fn()` must pair with the lambda child by identity
+    # and bind its result to relay's return.
+    relay_call = t.one_call("core.py:relay", parent)
+    mk = t.one_call("core.py:make_task", parent)
+    fn_idx = t.q("SELECT obj_idx FROM call_args WHERE pid = ? AND call_id = ? AND name = 'fn'",
+                 parent, relay_call[1])
+    expect(len(fn_idx) == 1, f"relay's callable parameter was not recorded: {fn_idx}")
+    lam_idx = t.q("SELECT func_idx FROM calls WHERE pid = ? AND call_id = ?", parent, lam[1])
+    expect(lam_idx[0][0] == fn_idx[0][0] and fn_idx[0][0] != 0,
+           f"lambda func_idx {lam_idx} does not match relay's fn arg {fn_idx}")
+    expect(len(t.q(
+        "SELECT 1 FROM dataflow_edges WHERE pid = ? AND source_call_id = ? "
+        "AND source_type = 'call_result' AND target_call_id = ? AND target_name = 'return'",
+        parent, lam[1], relay_call[1])) == 1,
+        "lambda result is not bound to relay's return (identity match failed)")
+
+    # Discriminating case: in `await fn(decoy())` the decoy child precedes
+    # the lambda in the line's queue, so position would pair `fn` with the
+    # decoy; only identity pairs it with the lambda.
+    relay_arg_call = t.one_call("core.py:relay_arg", parent)
+    arg_lam = t.one_call("run.<locals>.<lambda>", parent)
+    decoy_call = t.one_call("core.py:decoy", parent)
+    expect(len(t.q(
+        "SELECT 1 FROM dataflow_edges WHERE pid = ? AND source_call_id = ? "
+        "AND source_type = 'call_result' AND target_call_id = ? AND target_name = 'arg0'",
+        parent, decoy_call[1], arg_lam[1])) == 1,
+        "decoy() result is not arg0 of the lambda (callee paired by position, not identity)")
+    expect(len(t.q(
+        "SELECT 1 FROM dataflow_edges WHERE pid = ? AND source_call_id = ? "
+        "AND source_type = 'call_result' AND target_call_id = ? AND target_name = 'return'",
+        parent, arg_lam[1], relay_arg_call[1])) == 1,
+        "lambda result is not bound to relay_arg's return")
+
+    # Creation attribution: describe()'s coroutine is created inside the
+    # lambda but resumed by relay's `await fn()`; the tracer stamps the
+    # creator, and the resolver binds describe's arguments from the
+    # lambda's call expression.
+    describes = t.calls_of("core.py:describe", parent)
+    expect(len(describes) == 2, f"expected 2 describe calls, got {describes}")
+    created = {r[0] for r in t.q(
+        "SELECT created_id FROM calls WHERE pid = ? AND call_id IN (?, ?)",
+        parent, describes[0][1], describes[1][1])}
+    expect(created == {lam[1], arg_lam[1]},
+           f"describe coroutines are not stamped with their creating lambdas: {created}")
+    lam_describe = [c for c in describes if t.q(
+        "SELECT created_id FROM calls WHERE pid = ? AND call_id = ?", parent, c[1])[0][0] == lam[1]][0]
+    # The argument's source is the cell's writer (make_task), reached through
+    # the read the lambda recorded on the creating line.
+    expect(len(t.q(
+        "SELECT 1 FROM dataflow_edges WHERE pid = ? AND source_call_id = ? "
+        "AND source_type = 'attr_read' AND target_call_id = ? AND target_name = 'arg0'",
+        parent, mk[1], lam_describe[1])) == 1,
+        "describe's argument is not sourced from make_task's cell write")
+
+    poll_call = t.one_call("core.py:poll", parent)
+    poll_lines = t.executed(parent, poll_call[1])
+    expect(poll_lines.count(L("got += safe_index")) == 4 and poll_lines.count(L("got -= 1")) == 2,
+           f"poll(): handler entries not replayed (2 of 4 iterations raise): {poll_lines}")
+
     safe_div = t.one_call("core.py:safe_div", parent)
     expect(L("return a / b") in t.executed(parent, safe_div[1]), "safe_div try body not replayed")
 

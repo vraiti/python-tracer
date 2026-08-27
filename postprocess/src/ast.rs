@@ -1,22 +1,17 @@
 //! Statement skeletons produced by `python -m d3g.astdump`.
 //!
-//! Parsing is delegated to the interpreter that ran the traced program, so
-//! the statement structure replayed against the recorded control-flow bits
-//! is exactly the one that interpreter executed. Only what the resolver
-//! consumes crosses the pipe; the Python AST itself is discarded per file.
+//! Parsing is delegated to the interpreter that ran the traced program.
+//! Only the functions the trace references are requested, and only what the
+//! resolver consumes crosses the pipe, in the binary record format described
+//! in `Lib/d3g/astdump.py`.
 
-use serde::Deserialize;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashMap;
+use std::io::{BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-#[derive(Deserialize)]
-#[serde(tag = "k")]
 pub enum Expr {
-    #[serde(rename = "n")]
     Name { id: String },
-    #[serde(rename = "a")]
     Attr { c: Option<String>, l: i64 },
-    #[serde(rename = "c")]
     Call {
         l: i64,
         f: Option<String>,
@@ -25,113 +20,174 @@ pub enum Expr {
         kw: Vec<(Option<String>, Expr)>,
         nm: Vec<String>,
     },
-    #[serde(rename = "x")]
     Other { nm: Vec<String> },
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "k")]
 pub enum Target {
-    #[serde(rename = "n")]
     Name { id: String },
-    #[serde(rename = "a")]
     Attr { c: Option<String> },
-    #[serde(rename = "x")]
     Other,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "t")]
 pub enum StmtKind {
-    #[serde(rename = "for")]
-    For {
-        tg: Option<String>,
-        it: Expr,
-        b: Vec<Stmt>,
-        e: Vec<Stmt>,
-    },
-    #[serde(rename = "while")]
-    While { b: Vec<Stmt>, e: Vec<Stmt> },
-    #[serde(rename = "if")]
-    If { b: Vec<Stmt>, e: Vec<Stmt> },
-    #[serde(rename = "with")]
+    For { tg: Option<String>, it: Expr, b: Vec<Stmt>, e: Vec<Stmt> },
+    While { t: Expr, b: Vec<Stmt>, e: Vec<Stmt> },
+    If { t: Expr, b: Vec<Stmt>, e: Vec<Stmt> },
     With { b: Vec<Stmt> },
-    #[serde(rename = "try")]
-    Try { b: Vec<Stmt> },
-    #[serde(rename = "assign")]
+    /// `h`: handler, else and finally bodies (reached only through the
+    /// bytecode replay; the statement-skeleton fallback ignores them).
+    Try { b: Vec<Stmt>, h: Vec<Stmt> },
     Assign { tg: Vec<Target>, v: Expr },
-    #[serde(rename = "ann")]
     AnnAssign { tg: Option<String>, v: Option<Expr> },
-    #[serde(rename = "aug")]
     AugAssign { tg: Option<String>, v: Expr },
-    #[serde(rename = "ret")]
     Return { v: Option<Expr> },
-    #[serde(rename = "expr")]
     ExprCall { v: Expr },
-    #[serde(rename = "o")]
     Other,
 }
 
-#[derive(Deserialize)]
 pub struct Stmt {
     pub l: i64,
-    #[serde(flatten)]
     pub kind: StmtKind,
 }
 
-#[derive(Deserialize)]
 pub struct Def {
-    pub n: String,
-    #[serde(rename = "fn")]
-    pub is_fn: bool,
-    #[serde(default)]
     pub p: Vec<String>,
-    #[serde(default)]
     pub b: Vec<Stmt>,
-    #[serde(default)]
-    pub d: Vec<Def>,
-    /// Bytecode control-flow graph: `[line, kind, target]` per node (see
-    /// astdump.py); absent when the file did not compile.
-    #[serde(default)]
-    pub c: Option<Vec<(i64, u8, i64)>>,
 }
 
-#[derive(Deserialize)]
-pub struct Module {
-    pub d: Vec<Def>,
+const NONE: u32 = 0xFFFF_FFFF;
+
+struct Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    strings: Vec<String>,
 }
 
-impl Module {
-    /// `_find_function_node`: descend the qualname through directly nested
-    /// definitions; the final node must be a function. The function's
-    /// parameters and body are moved out so the module can be dropped while
-    /// only the functions the trace references stay resident; nested
-    /// definitions remain reachable through the emptied shell.
-    pub fn take_function(&mut self, qualname: &str) -> Option<Def> {
-        fn descend<'a>(defs: &'a mut [Def], parts: &[&str]) -> Option<&'a mut Def> {
-            let (first, rest) = parts.split_first()?;
-            let idx = defs.iter().position(|d| d.n == *first)?;
-            let found = &mut defs[idx];
-            if rest.is_empty() {
-                Some(found)
-            } else {
-                descend(&mut found.d, rest)
+type R<T> = Result<T, String>;
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> R<&'a [u8]> {
+        let end = self.pos + n;
+        if end > self.buf.len() {
+            return Err("truncated AST record".into());
+        }
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(s)
+    }
+    fn u8(&mut self) -> R<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> R<usize> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]) as usize)
+    }
+    fn u32(&mut self) -> R<u32> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn string(&mut self) -> R<String> {
+        let i = self.u32()?;
+        self.strings.get(i as usize).cloned().ok_or_else(|| "bad string index".to_string())
+    }
+    fn opt_string(&mut self) -> R<Option<String>> {
+        let i = self.u32()?;
+        if i == NONE {
+            return Ok(None);
+        }
+        self.strings.get(i as usize).cloned().map(Some).ok_or_else(|| "bad string index".to_string())
+    }
+    fn names(&mut self) -> R<Vec<String>> {
+        let n = self.u16()?;
+        (0..n).map(|_| self.string()).collect()
+    }
+    fn expr(&mut self) -> R<Expr> {
+        Ok(match self.u8()? {
+            0 => Expr::Name { id: self.string()? },
+            1 => Expr::Attr { c: self.opt_string()?, l: self.u32()? as i64 },
+            2 => {
+                let l = self.u32()? as i64;
+                let f = self.opt_string()?;
+                let o = self.opt_string()?;
+                let na = self.u16()?;
+                let a = (0..na).map(|_| self.expr()).collect::<R<_>>()?;
+                let nk = self.u16()?;
+                let mut kw = Vec::with_capacity(nk);
+                for _ in 0..nk {
+                    let name = self.opt_string()?;
+                    kw.push((name, self.expr()?));
+                }
+                Expr::Call { l, f, o, a, kw, nm: self.names()? }
             }
-        }
-        let parts: Vec<&str> = qualname.split('.').collect();
-        let node = descend(&mut self.d, &parts)?;
-        if !node.is_fn {
-            return None;
-        }
-        Some(Def {
-            n: node.n.clone(),
-            is_fn: true,
-            p: std::mem::take(&mut node.p),
-            b: std::mem::take(&mut node.b),
-            c: node.c.take(),
-            d: Vec::new(),
+            3 => Expr::Other { nm: self.names()? },
+            t => return Err(format!("bad expr tag {t}")),
         })
     }
+    fn opt_expr(&mut self) -> R<Option<Expr>> {
+        Ok(if self.u8()? == 0 { None } else { Some(self.expr()?) })
+    }
+    fn target(&mut self) -> R<Target> {
+        Ok(match self.u8()? {
+            0 => Target::Name { id: self.string()? },
+            1 => Target::Attr { c: self.opt_string()? },
+            _ => Target::Other,
+        })
+    }
+    fn body(&mut self) -> R<Vec<Stmt>> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n.min(1 << 16));
+        for _ in 0..n {
+            out.push(self.stmt()?);
+        }
+        Ok(out)
+    }
+    fn stmt(&mut self) -> R<Stmt> {
+        let l = self.u32()? as i64;
+        let kind = match self.u8()? {
+            1 => StmtKind::For { tg: self.opt_string()?, it: self.expr()?, b: self.body()?, e: self.body()? },
+            2 => StmtKind::While { t: self.expr()?, b: self.body()?, e: self.body()? },
+            3 => StmtKind::If { t: self.expr()?, b: self.body()?, e: self.body()? },
+            4 => StmtKind::With { b: self.body()? },
+            5 => StmtKind::Try { b: self.body()?, h: self.body()? },
+            6 => {
+                let n = self.u16()?;
+                let tg = (0..n).map(|_| self.target()).collect::<R<_>>()?;
+                StmtKind::Assign { tg, v: self.expr()? }
+            }
+            7 => StmtKind::AnnAssign { tg: self.opt_string()?, v: self.opt_expr()? },
+            8 => StmtKind::AugAssign { tg: self.opt_string()?, v: self.expr()? },
+            9 => StmtKind::Return { v: self.opt_expr()? },
+            10 => StmtKind::ExprCall { v: self.expr()? },
+            _ => StmtKind::Other,
+        };
+        Ok(Stmt { l, kind })
+    }
+}
+
+/// Decode one reply: `None` when the file was unavailable, else the
+/// requested functions by qualname.
+fn decode(buf: &[u8]) -> R<Option<HashMap<String, Def>>> {
+    let mut r = Reader { buf, pos: 0, strings: Vec::new() };
+    if r.u8()? == 0 {
+        return Ok(None);
+    }
+    let ns = r.u32()? as usize;
+    r.strings.reserve(ns);
+    for _ in 0..ns {
+        let n = r.u16()?;
+        let bytes = r.take(n)?;
+        r.strings.push(String::from_utf8_lossy(bytes).into_owned());
+    }
+    let nf = r.u32()? as usize;
+    let mut out = HashMap::with_capacity(nf);
+    for _ in 0..nf {
+        let q = r.string()?;
+        let np = r.u16()?;
+        let p = (0..np).map(|_| r.string()).collect::<R<_>>()?;
+        let b = r.body()?;
+        out.insert(q, Def { p, b });
+    }
+    Ok(Some(out))
 }
 
 /// Persistent `python -m d3g.astdump` child; one request line per file.
@@ -139,7 +195,7 @@ pub struct AstServer {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    line: String,
+    buf: Vec<u8>,
 }
 
 impl AstServer {
@@ -155,27 +211,35 @@ impl AstServer {
             .spawn()?;
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        Ok(Self { child, stdin, stdout, line: String::new() })
+        Ok(Self { child, stdin, stdout, buf: Vec::new() })
     }
 
-    /// Parse `path`. `None` when the file is unreadable or does not parse.
-    /// Nothing is cached here: the caller keeps only what it needs.
-    pub fn module(&mut self, path: &str) -> Option<Module> {
-        if path.contains('\n') {
+    /// Fetch `qualnames` from `path`. `None` when the file is unreadable
+    /// or does not parse; functions not found are absent from the map.
+    pub fn functions(&mut self, path: &str, qualnames: &[String]) -> Option<HashMap<String, Def>> {
+        if path.contains(['\n', '\t']) || qualnames.iter().any(|q| q.contains(['\n', '\t'])) {
             return None;
         }
-        writeln!(self.stdin, "{path}").ok()?;
+        let mut req = String::from(path);
+        for q in qualnames {
+            req.push('\t');
+            req.push_str(q);
+        }
+        req.push('\n');
+        self.stdin.write_all(req.as_bytes()).ok()?;
         self.stdin.flush().ok()?;
-        self.line.clear();
-        let n = self.stdout.read_line(&mut self.line).ok()?;
-        if n == 0 {
+        let mut len = [0u8; 4];
+        if self.stdout.read_exact(&mut len).is_err() {
             eprintln!("d3g-postprocess: AST helper exited");
             std::process::exit(1);
         }
-        // Deeply nested bodies exceed serde_json's default depth limit.
-        let mut de = serde_json::Deserializer::from_str(&self.line);
-        de.disable_recursion_limit();
-        match <Option<Module> as serde::Deserialize>::deserialize(&mut de) {
+        let n = u32::from_le_bytes(len) as usize;
+        self.buf.resize(n, 0);
+        if self.stdout.read_exact(&mut self.buf).is_err() {
+            eprintln!("d3g-postprocess: AST helper exited");
+            std::process::exit(1);
+        }
+        match decode(&self.buf) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("d3g-postprocess: bad AST reply for {path}: {e}");
