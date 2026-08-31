@@ -8,6 +8,9 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -42,16 +45,26 @@ jobs:
           mkdir -p dist/d3g/bin dist/d3g/configs
           cp -r build/. dist/d3g/
           cp -r configs/. dist/d3g/configs/
-          tar -C dist -czf d3g-${{ runner.os }}-${{ github.sha }}.tar.gz d3g
+          tar -C dist -czf d3g-python-latest.tar.gz d3g
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: d3g-build-${{ runner.os }}
-          path: d3g-${{ runner.os }}-${{ github.sha }}.tar.gz
+          path: d3g-python-latest.tar.gz
 
-      - name: Publish to GitHub release
+      - name: Publish versioned GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: d3g-${{ runner.os }}-${{ github.sha }}.tar.gz
+          files: d3g-python-latest.tar.gz
+
+      - name: Publish rolling "latest" release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: d3g-python-latest
+          name: d3g-python-latest
+          prerelease: true
+          make_latest: false
+          files: d3g-python-latest.tar.gz
