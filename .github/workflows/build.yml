@@ -42,10 +42,10 @@ jobs:
 
       - name: Stage release archive
         run: |
-          mkdir -p dist/d3g/bin dist/d3g/configs
-          cp -r build/. dist/d3g/
-          cp -r configs/. dist/d3g/configs/
-          tar -C dist -czf d3g-python-latest.tar.gz d3g
+          mkdir -p dist/d3g-python-latest/bin dist/d3g-python-latest/configs
+          cp -r build/. dist/d3g-python-latest/
+          cp -r configs/. dist/d3g-python-latest/configs/
+          tar -C dist -czf d3g-python-latest.tar.gz d3g-python-latest
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
