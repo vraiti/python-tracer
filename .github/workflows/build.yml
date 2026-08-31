@@ -1,0 +1,57 @@
+name: Build and publish artifacts
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config zlib1g-dev libssl-dev \
+            libbz2-dev libreadline-dev libsqlite3-dev libffi-dev liblzma-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            postprocess/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('postprocess/Cargo.lock') }}
+
+      - name: Build cpython and postprocess
+        run: make build
+
+      - name: Stage release archive
+        run: |
+          mkdir -p dist/d3g/bin dist/d3g/configs
+          cp -r build/. dist/d3g/
+          cp -r configs/. dist/d3g/configs/
+          tar -C dist -czf d3g-${{ runner.os }}-${{ github.sha }}.tar.gz d3g
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: d3g-build-${{ runner.os }}
+          path: d3g-${{ runner.os }}-${{ github.sha }}.tar.gz
+
+      - name: Publish to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: d3g-${{ runner.os }}-${{ github.sha }}.tar.gz
