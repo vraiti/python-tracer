@@ -25,12 +25,12 @@ use std::time::Instant;
 type Key = (i64, i64);
 
 fn usage() -> ! {
-    eprintln!("usage: d3g-postprocess [--python PYTHON] TARGET\n\n\
-               TARGET is a trace output directory (its per-process {{pid}}.db files are\n\
-               read in place; the dependency graph and blob-free copies of the input\n\
-               tables are written to trace.db) or a single trace database.\n\
-               PYTHON is the interpreter used to parse source files\n\
-               (default: python3).\n\n\
+    eprintln!("usage: d3g-postprocess TRACE_SUBDIR\n\n\
+               TRACE_SUBDIR is a subdirectory of $PYTHON_D3G_OUTDIR (its per-process\n\
+               {{pid}}.db files are read in place; the dependency graph and\n\
+               blob-free copies of the input tables are written to trace.db).\n\
+               The interpreter used to parse source files is $VIRTUAL_ENV/bin/python3\n\
+               ($VIRTUAL_ENV must be set).\n\n\
                d3g-postprocess reach TRACE_DB SRC_PID:SRC_CALL DST_PID:DST_CALL\n\
                Reports whether a dataflow path connects the two calls, with a\n\
                shortest witness path.");
@@ -43,8 +43,6 @@ fn parse_call(s: &str) -> Option<(i64, i64)> {
 }
 
 fn main() {
-    let mut python = String::from("python3");
-    let mut target: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     if std::env::args().nth(1).as_deref() == Some("reach") {
         let a: Vec<String> = std::env::args().skip(2).collect();
@@ -59,15 +57,29 @@ fn main() {
         }
         return;
     }
+
+    let mut subdir: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--python" => python = args.next().unwrap_or_else(|| usage()),
             "-h" | "--help" => usage(),
-            _ if target.is_none() => target = Some(PathBuf::from(a)),
+            _ if subdir.is_none() => subdir = Some(a),
             _ => usage(),
         }
     }
-    let Some(target) = target else { usage() };
+    let Some(subdir) = subdir else { usage() };
+
+    let venv = std::env::var("VIRTUAL_ENV").unwrap_or_else(|_| {
+        eprintln!("Error: VIRTUAL_ENV not set");
+        std::process::exit(1);
+    });
+    let python = format!("{venv}/bin/python3");
+
+    let outdir = std::env::var("PYTHON_D3G_OUTDIR").unwrap_or_else(|_| {
+        eprintln!("Error: PYTHON_D3G_OUTDIR not set");
+        std::process::exit(1);
+    });
+    let target = PathBuf::from(outdir).join(subdir);
+
     // D3G_REPLAY=skeleton selects the statement-skeleton replay (the
     // original algorithm) instead of the bytecode CFG walk; for comparison.
     let skeleton_replay = std::env::var("D3G_REPLAY").map(|v| v == "skeleton").unwrap_or(false);
