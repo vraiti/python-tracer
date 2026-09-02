@@ -80,6 +80,14 @@ fn main() {
     });
     let target = PathBuf::from(outdir).join(subdir);
 
+    // Read, then mask: the python subprocess spawned below (ast.rs's
+    // AstServer) inherits this process's environment, and a d3g-instrumented
+    // python3 would otherwise trace itself while merely parsing source for
+    // us, polluting (or recursively depending on) the trace we're
+    // postprocessing.
+    std::env::remove_var("PYTHON_D3G_CONFIG");
+    std::env::remove_var("PYTHON_D3G_OUTDIR");
+
     // D3G_REPLAY=skeleton selects the statement-skeleton replay (the
     // original algorithm) instead of the bytecode CFG walk; for comparison.
     let skeleton_replay = std::env::var("D3G_REPLAY").map(|v| v == "skeleton").unwrap_or(false);
