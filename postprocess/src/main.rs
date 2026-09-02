@@ -20,6 +20,7 @@ use resolve::{AttrRead, CallInfo, Edge, Kind, TargetType};
 use rusqlite::{params, Connection, Statement};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Instant;
 
 type Key = (i64, i64);
@@ -403,7 +404,6 @@ fn postprocess(target: &Path, python: &str, skeleton_replay: bool) -> Result<(),
 
     let mut objects: IndexMap<Key, i64> = IndexMap::new();
     let mut members: IndexMap<Key, IndexMap<String, i64>> = IndexMap::new();
-    let mut n_attr_reads: i64 = 0;
     for i in 0..input_paths.len() {
         let ic = input_conn(i);
         for (key, cid) in query(ic, "SELECT pid, obj_idx, call_id FROM objects", |r| {
@@ -418,14 +418,8 @@ fn postprocess(target: &Path, python: &str, skeleton_replay: bool) -> Result<(),
         {
             members.entry((pid, obj_idx)).or_default().insert(attr, child_idx);
         }
-        n_attr_reads += ic
-            .query_row("SELECT count(*) FROM attr_reads", [], |r| r.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?;
     }
     let init_calls: HashSet<Key> = objects.iter().map(|(&(pid, _), &cid)| (pid, cid)).collect();
-
-    let asts = AstServer::spawn(python).map_err(|e| format!("cannot start {python}: {e}"))?;
-    let mut funcs = FuncCache::new(asts, func_map.values().cloned());
 
     // ---- streaming pass over calls -------------------------------------
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -439,258 +433,82 @@ fn postprocess(target: &Path, python: &str, skeleton_replay: bool) -> Result<(),
         n_edges: 0,
         n_lines: 0,
     };
-    let no_args: HashMap<String, i64> = HashMap::new();
-    let mut call_args: HashMap<Key, HashMap<String, i64>> = HashMap::new();
 
     // attr_write edges whose source is an object's __init__ call, for
     // default_owner: (pid, source_call_id, target_call_id, target_obj_id, attr).
     let mut owner_writes: HashMap<Key, Vec<(i64, i64, String)>> = HashMap::new();
 
     let (mut n_resolved, mut n_skipped, mut n_calls) = (0usize, 0usize, 0usize);
-    let mut ar_consumed: i64 = 0;
 
-    for input_i in 0..input_paths.len() {
-    let ic = input_conn(input_i);
-    let fmap = &fmaps[input_i];
-    let mut obj_of_call = ic
-        .prepare("SELECT obj_id FROM calls WHERE pid = ?1 AND call_id = ?2")
-        .map_err(|e| e.to_string())?;
+    // Per-process trace files are fully independent (each their own db, own
+    // rowid ordering, own attr_reads lockstep cursor) once the shared
+    // read-only tables above (func_map/cfg_map/members/objects/init_calls)
+    // are built -- process them on one thread per input, each with its own
+    // connection and its own AstServer subprocess (re-parsing a shared
+    // source file per thread trades a little duplicated AST work for not
+    // having to share a FuncCache/AstServer pipe across threads). Only the
+    // final write into `w`/`owner_writes`/the counters happens back on this
+    // thread, so `conn`'s single write path is untouched. Skipped entirely
+    // for a single input (including the non-directory case, where the lone
+    // "input" is `conn` itself, already mid-transaction).
+    let per_input: Vec<Result<InputResult, String>> = if input_paths.len() > 1 {
+        thread::scope(|scope| {
+            let handles: Vec<_> = (0..input_paths.len())
+                .map(|i| {
+                    let path = &input_paths[i];
+                    let fmap = &fmaps[i];
+                    let func_map = &func_map;
+                    let cfg_map = &cfg_map;
+                    let members = &members;
+                    let objects = &objects;
+                    let init_calls = &init_calls;
+                    scope.spawn(move || {
+                        let ic = Connection::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                        ic.execute_batch("PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY;")
+                            .map_err(|e| e.to_string())?;
+                        process_input(
+                            &ic, fmap, func_map, cfg_map, members, objects, init_calls, python,
+                            skeleton_replay,
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        })
+    } else {
+        vec![process_input(
+            input_conn(0), &fmaps[0], &func_map, &cfg_map, &members, &objects, &init_calls, python,
+            skeleton_replay,
+        )]
+    };
 
-    // Callable identity (traces without it resolve as before, minus
-    // identity matching of variable callees).
-    let has_identity = ic.prepare("SELECT func_idx FROM calls LIMIT 1").is_ok();
-    // Generator/coroutine bodies group under their creating call (where the
-    // call expression naming their arguments lives), not the resuming one.
-    let has_creation = ic.prepare("SELECT created_id FROM calls LIMIT 1").is_ok();
-    if has_creation {
-        // A virtual generated column keeps the parent join sargable; a bare
-        // expression index is not reliably chosen by the planner.
-        if ic.prepare("SELECT resolve_parent FROM calls LIMIT 1").is_err() {
-            ic.execute_batch(
-                "ALTER TABLE calls ADD COLUMN resolve_parent INTEGER \
-                 GENERATED ALWAYS AS (ifnull(nullif(created_id, 0), caller_id)) VIRTUAL;",
-            )
-            .map_err(|e| e.to_string())?;
+    for result in per_input {
+        let r = result?;
+        n_resolved += r.n_resolved;
+        n_skipped += r.n_skipped;
+        n_calls += r.n_calls;
+        if r.ar_consumed != r.n_attr_reads {
+            return Err(format!(
+                "attr_reads not aligned with calls ({} of {} consumed); \
+                 the trace was not written by the D3G writer in call order",
+                r.ar_consumed, r.n_attr_reads
+            ));
         }
-        ic.execute_batch(
-            "CREATE INDEX IF NOT EXISTS calls_by_parent ON calls(pid, resolve_parent);",
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    if has_identity {
-        let mut stmt = ic
-            .prepare("SELECT pid, call_id, name, obj_idx FROM call_args")
-            .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
-            let key: Key = (r.get_unwrap(0), r.get_unwrap(1));
-            call_args
-                .entry(key)
-                .or_default()
-                .insert(r.get_unwrap(2), r.get_unwrap(3));
+        for e in r.edges {
+            w.edge(&e).map_err(|e| e.to_string())?;
         }
-    }
-
-    // Each call joined to its children (index order = child rowid order, so
-    // the last child per line wins as in the original dict build).
-    let mut calls_stmt = ic
-        .prepare(
-            if has_creation {
-                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, \
-                        CASE WHEN c.created_id <> 0 AND c.created_lineno <> 0 \
-                             THEN c.created_lineno ELSE c.call_lineno END, \
-                        c.function_id, c.func_idx \
-                 FROM calls p LEFT JOIN calls c \
-                   ON c.pid = p.pid AND c.resolve_parent = p.call_id \
-                 ORDER BY p.rowid"
-            } else if has_identity {
-                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, c.call_lineno, c.function_id, c.func_idx \
-                 FROM calls p LEFT JOIN calls c ON c.pid = p.pid AND c.caller_id = p.call_id \
-                 ORDER BY p.rowid"
-            } else {
-                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, c.call_lineno, c.function_id, 0 \
-                 FROM calls p LEFT JOIN calls c ON c.pid = p.pid AND c.caller_id = p.call_id \
-                 ORDER BY p.rowid"
-            },
-        )
-        .map_err(|e| e.to_string())?;
-    let mut calls_rows = calls_stmt.query([]).map_err(|e| e.to_string())?;
-
-    // attr_reads rows are emitted with their call, so rowid order follows
-    // calls rowid order; consume them in lockstep.
-    let mut ar_stmt = ic
-        .prepare("SELECT pid, call_id, caller_id, read_call_lineno FROM attr_reads ORDER BY rowid")
-        .map_err(|e| e.to_string())?;
-    let mut ar_rows = ar_stmt.query([]).map_err(|e| e.to_string())?;
-    let mut ar_pending: Option<(Key, AttrRead)> = None;
-
-    let mut current: Option<(CallInfo, Vec<CallInfo>)> = None;
-
-    let mut process = |ci: CallInfo,
-                       children: Vec<CallInfo>,
-                       funcs: &mut FuncCache,
-                       w: &mut Writer,
-                       ar_rows: &mut rusqlite::Rows,
-                       ar_pending: &mut Option<(Key, AttrRead)>,
-                       obj_of_call: &mut Statement|
-     -> Result<(), String> {
-        // Collect this call's attr_reads from the lockstep cursor.
-        let key = (ci.pid, ci.call_id);
-        let mut reads: Vec<AttrRead> = Vec::new();
-        loop {
-            if ar_pending.is_none() {
-                match ar_rows.next().map_err(|e| e.to_string())? {
-                    Some(r) => {
-                        let k: Key = (r.get(0).map_err(|e| e.to_string())?, r.get(1).map_err(|e| e.to_string())?);
-                        let ar = AttrRead {
-                            caller_id: r.get(2).map_err(|e| e.to_string())?,
-                            read_call_lineno: r.get(3).map_err(|e| e.to_string())?,
-                        };
-                        *ar_pending = Some((k, ar));
-                    }
-                    None => break,
-                }
-            }
-            if ar_pending.as_ref().unwrap().0 == key {
-                reads.push(ar_pending.take().unwrap().1);
-                ar_consumed += 1;
-            } else {
-                break;
-            }
-        }
-
-        let Some(func) = funcs.get(&ci.ref_) else {
-            n_skipped += 1;
-            return Ok(());
-        };
-        let blob = ci.control_flow.as_deref().unwrap_or(&[]);
-        let executed = match cfg_map.get(&ci.function_id) {
-            Some(cfg) if !skeleton_replay => {
-                if blob.len() >= 100_000 {
-                    eprintln!("  large control-flow record: {} bytes, cfg {} nodes: {}", blob.len(), cfg.len(), ci.ref_);
-                }
-                let ex = resolve::replay_cfg(&func.b, cfg, blob);
-                let steps = resolve::REPLAY_STEPS.with(|c| c.get());
-                if steps >= 200_000 {
-                    eprintln!("  slow replay: {} steps, blob {} bytes, {} stmts, cfg {} nodes: {}", steps, blob.len(), ex.len(), cfg.len(), ci.ref_);
-                }
-                ex
-            }
-            _ => resolve::reconstruct(&func.b, blob),
-        };
-        for (order, stmt) in executed.iter().enumerate() {
+        for (pid, call_id, order, lineno) in r.lines {
             w.line
-                .execute(params![ci.pid, ci.call_id, order as i64, stmt.l])
+                .execute(params![pid, call_id, order, lineno])
                 .map_err(|e| e.to_string())?;
             w.n_lines += 1;
         }
-        let child_refs: Vec<&CallInfo> = children.iter().collect();
-        let arg_funcs = call_args.get(&(ci.pid, ci.call_id)).unwrap_or(&no_args);
-        let edges = resolve::resolve_intra_call(&ci, func, &executed, &child_refs, &reads, arg_funcs);
-        for e in &edges {
-            w.edge(e).map_err(|e| e.to_string())?;
-            // merge_graphs: attr_read edges through tracked members.
-            if e.source_type == Kind::AttrRead {
-                if let Some(mp) = &e.member_path {
-                    if let Some((_, attr)) = mp.rsplit_once('.') {
-                        let src_obj: i64 = obj_of_call
-                            .query_row(params![e.pid, e.source_call_id], |r| r.get(0))
-                            .unwrap_or(0);
-                        if src_obj > 0 {
-                            if let Some(&child_idx) = members.get(&(e.pid, src_obj)).and_then(|m| m.get(attr)) {
-                                let child_call_id = objects.get(&(e.pid, child_idx)).copied().unwrap_or(0);
-                                if child_call_id != 0 {
-                                    w.edge(&Edge {
-                                        pid: e.pid,
-                                        source_call_id: child_call_id,
-                                        source_type: Kind::Member,
-                                        source_name: attr.to_string(),
-                                        target_pid: e.target_pid,
-                                        target_call_id: e.target_call_id,
-                                        target_type: e.target_type,
-                                        target_name: e.target_name.clone(),
-                                        member_path: Some(mp.clone()),
-                                    })
-                                    .map_err(|e| e.to_string())?;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if e.target_type == TargetType::AttrWrite && init_calls.contains(&(e.pid, e.source_call_id)) {
-                let attr = e.target_name.rsplit('.').next().unwrap().to_string();
-                owner_writes
-                    .entry((e.pid, e.source_call_id))
-                    .or_default()
-                    .push((e.target_call_id, ci.obj_id, attr));
-            }
+        for (k, mut v) in r.owner_writes {
+            owner_writes.entry(k).or_default().append(&mut v);
         }
-        n_resolved += 1;
-        Ok(())
-    };
+        eprintln!("  {} calls, {} edges, {} lines, {:.0}s", n_calls, w.n_edges, w.n_lines, t0.elapsed().as_secs_f64());
+    }
 
-    loop {
-        let row = calls_rows.next().map_err(|e| e.to_string())?;
-        let Some(r) = row else { break };
-        let pid: i64 = r.get(0).map_err(|e| e.to_string())?;
-        let call_id: i64 = r.get(1).map_err(|e| e.to_string())?;
-        let same = matches!(&current, Some((c, _)) if c.pid == pid && c.call_id == call_id);
-        if !same {
-            n_calls += 1;
-            if let Some((ci, children)) = current.take() {
-                process(ci, children, &mut funcs, &mut w, &mut ar_rows, &mut ar_pending, &mut obj_of_call)?;
-            }
-            let raw_fid: i64 = r.get(2).map_err(|e| e.to_string())?;
-            let function_id = fmap.get(&raw_fid).copied().unwrap_or(raw_fid);
-            let cf: Option<Vec<u8>> = r.get(4).map_err(|e| e.to_string())?;
-            current = Some((
-                CallInfo {
-                    pid,
-                    call_id,
-                    function_id,
-                    call_lineno: 0,
-                    obj_id: r.get(3).map_err(|e| e.to_string())?,
-                    control_flow: cf.filter(|b| !b.is_empty()),
-                    ref_: func_map.get(&function_id).cloned().unwrap_or_default(),
-                    func_idx: 0,
-                },
-                Vec::new(),
-            ));
-        }
-        let child_id: Option<i64> = r.get(5).map_err(|e| e.to_string())?;
-        if let Some(child_id) = child_id {
-            let (_, children) = current.as_mut().unwrap();
-            let raw_fid: i64 = r.get(7).map_err(|e| e.to_string())?;
-            let fid = fmap.get(&raw_fid).copied().unwrap_or(raw_fid);
-            children.push(CallInfo {
-                pid,
-                call_id: child_id,
-                function_id: fid,
-                call_lineno: r.get(6).map_err(|e| e.to_string())?,
-                obj_id: 0,
-                control_flow: None,
-                ref_: func_map.get(&fid).cloned().unwrap_or_default(),
-                func_idx: r.get(8).map_err(|e| e.to_string())?,
-            });
-        }
-        if n_calls % 1_000_000 == 0 && n_calls > 0 && !same {
-            eprintln!("  {n_calls} calls, {} edges, {} lines, {:.0}s", w.n_edges, w.n_lines, t0.elapsed().as_secs_f64());
-        }
-    }
-    if let Some((ci, children)) = current.take() {
-        process(ci, children, &mut funcs, &mut w, &mut ar_rows, &mut ar_pending, &mut obj_of_call)?;
-    }
-    drop(calls_rows);
-    drop(ar_rows);
-    } // per-input streaming loop
-    if ar_consumed != n_attr_reads {
-        return Err(format!(
-            "attr_reads not aligned with calls ({ar_consumed} of {n_attr_reads} consumed); \
-             the trace was not written by the D3G writer in call order"
-        ));
-    }
-    drop(funcs);
     eprintln!(
         "resolved {n_resolved} calls ({n_skipped} skipped): {} edges, {} executed lines in {:.1}s",
         w.n_edges,
@@ -898,6 +716,277 @@ fn postprocess(target: &Path, python: &str, skeleton_replay: bool) -> Result<(),
         t0.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+struct InputResult {
+    edges: Vec<Edge>,
+    lines: Vec<(i64, i64, i64, i64)>,
+    owner_writes: HashMap<Key, Vec<(i64, i64, String)>>,
+    n_resolved: usize,
+    n_skipped: usize,
+    n_calls: usize,
+    ar_consumed: i64,
+    n_attr_reads: i64,
+}
+
+fn process_input(
+    ic: &Connection,
+    fmap: &HashMap<i64, i64>,
+    func_map: &HashMap<i64, String>,
+    cfg_map: &HashMap<i64, Vec<(i64, u8, i64)>>,
+    members: &IndexMap<Key, IndexMap<String, i64>>,
+    objects: &IndexMap<Key, i64>,
+    init_calls: &HashSet<Key>,
+    python: &str,
+    skeleton_replay: bool,
+) -> Result<InputResult, String> {
+    let n_attr_reads: i64 = ic
+        .query_row("SELECT count(*) FROM attr_reads", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+
+    let asts = AstServer::spawn(python).map_err(|e| format!("cannot start {python}: {e}"))?;
+    let mut funcs = FuncCache::new(asts, func_map.values().cloned());
+
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut lines: Vec<(i64, i64, i64, i64)> = Vec::new();
+    let mut owner_writes: HashMap<Key, Vec<(i64, i64, String)>> = HashMap::new();
+    let no_args: HashMap<String, i64> = HashMap::new();
+    let mut call_args: HashMap<Key, HashMap<String, i64>> = HashMap::new();
+    let (mut n_resolved, mut n_skipped, mut n_calls) = (0usize, 0usize, 0usize);
+    let mut ar_consumed: i64 = 0;
+    {
+    let mut obj_of_call = ic
+        .prepare("SELECT obj_id FROM calls WHERE pid = ?1 AND call_id = ?2")
+        .map_err(|e| e.to_string())?;
+
+    // Callable identity (traces without it resolve as before, minus
+    // identity matching of variable callees).
+    let has_identity = ic.prepare("SELECT func_idx FROM calls LIMIT 1").is_ok();
+    // Generator/coroutine bodies group under their creating call (where the
+    // call expression naming their arguments lives), not the resuming one.
+    let has_creation = ic.prepare("SELECT created_id FROM calls LIMIT 1").is_ok();
+    if has_creation {
+        // A virtual generated column keeps the parent join sargable; a bare
+        // expression index is not reliably chosen by the planner.
+        if ic.prepare("SELECT resolve_parent FROM calls LIMIT 1").is_err() {
+            ic.execute_batch(
+                "ALTER TABLE calls ADD COLUMN resolve_parent INTEGER \
+                 GENERATED ALWAYS AS (ifnull(nullif(created_id, 0), caller_id)) VIRTUAL;",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        ic.execute_batch(
+            "CREATE INDEX IF NOT EXISTS calls_by_parent ON calls(pid, resolve_parent);",
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if has_identity {
+        let mut stmt = ic
+            .prepare("SELECT pid, call_id, name, obj_idx FROM call_args")
+            .map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            let key: Key = (r.get_unwrap(0), r.get_unwrap(1));
+            call_args
+                .entry(key)
+                .or_default()
+                .insert(r.get_unwrap(2), r.get_unwrap(3));
+        }
+    }
+
+    // Each call joined to its children (index order = child rowid order, so
+    // the last child per line wins as in the original dict build).
+    let mut calls_stmt = ic
+        .prepare(
+            if has_creation {
+                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, \
+                        CASE WHEN c.created_id <> 0 AND c.created_lineno <> 0 \
+                             THEN c.created_lineno ELSE c.call_lineno END, \
+                        c.function_id, c.func_idx \
+                 FROM calls p LEFT JOIN calls c \
+                   ON c.pid = p.pid AND c.resolve_parent = p.call_id \
+                 ORDER BY p.rowid"
+            } else if has_identity {
+                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, c.call_lineno, c.function_id, c.func_idx \
+                 FROM calls p LEFT JOIN calls c ON c.pid = p.pid AND c.caller_id = p.call_id \
+                 ORDER BY p.rowid"
+            } else {
+                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, c.call_lineno, c.function_id, 0 \
+                 FROM calls p LEFT JOIN calls c ON c.pid = p.pid AND c.caller_id = p.call_id \
+                 ORDER BY p.rowid"
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    let mut calls_rows = calls_stmt.query([]).map_err(|e| e.to_string())?;
+
+    // attr_reads rows are emitted with their call, so rowid order follows
+    // calls rowid order; consume them in lockstep.
+    let mut ar_stmt = ic
+        .prepare("SELECT pid, call_id, caller_id, read_call_lineno FROM attr_reads ORDER BY rowid")
+        .map_err(|e| e.to_string())?;
+    let mut ar_rows = ar_stmt.query([]).map_err(|e| e.to_string())?;
+    let mut ar_pending: Option<(Key, AttrRead)> = None;
+
+    let mut current: Option<(CallInfo, Vec<CallInfo>)> = None;
+
+    let mut process = |ci: CallInfo,
+                       children: Vec<CallInfo>,
+                       funcs: &mut FuncCache,
+                       edges_out: &mut Vec<Edge>,
+                       lines_out: &mut Vec<(i64, i64, i64, i64)>,
+                       ar_rows: &mut rusqlite::Rows,
+                       ar_pending: &mut Option<(Key, AttrRead)>,
+                       obj_of_call: &mut Statement|
+     -> Result<(), String> {
+        // Collect this call's attr_reads from the lockstep cursor.
+        let key = (ci.pid, ci.call_id);
+        let mut reads: Vec<AttrRead> = Vec::new();
+        loop {
+            if ar_pending.is_none() {
+                match ar_rows.next().map_err(|e| e.to_string())? {
+                    Some(r) => {
+                        let k: Key = (r.get(0).map_err(|e| e.to_string())?, r.get(1).map_err(|e| e.to_string())?);
+                        let ar = AttrRead {
+                            caller_id: r.get(2).map_err(|e| e.to_string())?,
+                            read_call_lineno: r.get(3).map_err(|e| e.to_string())?,
+                        };
+                        *ar_pending = Some((k, ar));
+                    }
+                    None => break,
+                }
+            }
+            if ar_pending.as_ref().unwrap().0 == key {
+                reads.push(ar_pending.take().unwrap().1);
+                ar_consumed += 1;
+            } else {
+                break;
+            }
+        }
+
+        let Some(func) = funcs.get(&ci.ref_) else {
+            n_skipped += 1;
+            return Ok(());
+        };
+        let blob = ci.control_flow.as_deref().unwrap_or(&[]);
+        let executed = match cfg_map.get(&ci.function_id) {
+            Some(cfg) if !skeleton_replay => {
+                if blob.len() >= 100_000 {
+                    eprintln!("  large control-flow record: {} bytes, cfg {} nodes: {}", blob.len(), cfg.len(), ci.ref_);
+                }
+                let ex = resolve::replay_cfg(&func.b, cfg, blob);
+                let steps = resolve::REPLAY_STEPS.with(|c| c.get());
+                if steps >= 200_000 {
+                    eprintln!("  slow replay: {} steps, blob {} bytes, {} stmts, cfg {} nodes: {}", steps, blob.len(), ex.len(), cfg.len(), ci.ref_);
+                }
+                ex
+            }
+            _ => resolve::reconstruct(&func.b, blob),
+        };
+        for (order, stmt) in executed.iter().enumerate() {
+            lines_out.push((ci.pid, ci.call_id, order as i64, stmt.l));
+        }
+        let child_refs: Vec<&CallInfo> = children.iter().collect();
+        let arg_funcs = call_args.get(&(ci.pid, ci.call_id)).unwrap_or(&no_args);
+        let edges = resolve::resolve_intra_call(&ci, func, &executed, &child_refs, &reads, arg_funcs);
+        for e in edges {
+            // merge_graphs: attr_read edges through tracked members.
+            if e.source_type == Kind::AttrRead {
+                if let Some(mp) = &e.member_path {
+                    if let Some((_, attr)) = mp.rsplit_once('.') {
+                        let src_obj: i64 = obj_of_call
+                            .query_row(params![e.pid, e.source_call_id], |r| r.get(0))
+                            .unwrap_or(0);
+                        if src_obj > 0 {
+                            if let Some(&child_idx) = members.get(&(e.pid, src_obj)).and_then(|m| m.get(attr)) {
+                                let child_call_id = objects.get(&(e.pid, child_idx)).copied().unwrap_or(0);
+                                if child_call_id != 0 {
+                                    edges_out.push(Edge {
+                                        pid: e.pid,
+                                        source_call_id: child_call_id,
+                                        source_type: Kind::Member,
+                                        source_name: attr.to_string(),
+                                        target_pid: e.target_pid,
+                                        target_call_id: e.target_call_id,
+                                        target_type: e.target_type,
+                                        target_name: e.target_name.clone(),
+                                        member_path: Some(mp.clone()),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if e.target_type == TargetType::AttrWrite && init_calls.contains(&(e.pid, e.source_call_id)) {
+                let attr = e.target_name.rsplit('.').next().unwrap().to_string();
+                owner_writes
+                    .entry((e.pid, e.source_call_id))
+                    .or_default()
+                    .push((e.target_call_id, ci.obj_id, attr));
+            }
+            edges_out.push(e);
+        }
+        n_resolved += 1;
+        Ok(())
+    };
+
+    loop {
+        let row = calls_rows.next().map_err(|e| e.to_string())?;
+        let Some(r) = row else { break };
+        let pid: i64 = r.get(0).map_err(|e| e.to_string())?;
+        let call_id: i64 = r.get(1).map_err(|e| e.to_string())?;
+        let same = matches!(&current, Some((c, _)) if c.pid == pid && c.call_id == call_id);
+        if !same {
+            n_calls += 1;
+            if let Some((ci, children)) = current.take() {
+                process(ci, children, &mut funcs, &mut edges, &mut lines, &mut ar_rows, &mut ar_pending, &mut obj_of_call)?;
+            }
+            let raw_fid: i64 = r.get(2).map_err(|e| e.to_string())?;
+            let function_id = fmap.get(&raw_fid).copied().unwrap_or(raw_fid);
+            let cf: Option<Vec<u8>> = r.get(4).map_err(|e| e.to_string())?;
+            current = Some((
+                CallInfo {
+                    pid,
+                    call_id,
+                    function_id,
+                    call_lineno: 0,
+                    obj_id: r.get(3).map_err(|e| e.to_string())?,
+                    control_flow: cf.filter(|b| !b.is_empty()),
+                    ref_: func_map.get(&function_id).cloned().unwrap_or_default(),
+                    func_idx: 0,
+                },
+                Vec::new(),
+            ));
+        }
+        let child_id: Option<i64> = r.get(5).map_err(|e| e.to_string())?;
+        if let Some(child_id) = child_id {
+            let (_, children) = current.as_mut().unwrap();
+            let raw_fid: i64 = r.get(7).map_err(|e| e.to_string())?;
+            let fid = fmap.get(&raw_fid).copied().unwrap_or(raw_fid);
+            children.push(CallInfo {
+                pid,
+                call_id: child_id,
+                function_id: fid,
+                call_lineno: r.get(6).map_err(|e| e.to_string())?,
+                obj_id: 0,
+                control_flow: None,
+                ref_: func_map.get(&fid).cloned().unwrap_or_default(),
+                func_idx: r.get(8).map_err(|e| e.to_string())?,
+            });
+        }
+        if n_calls % 1_000_000 == 0 && n_calls > 0 && !same {
+            eprintln!("  {n_calls} calls, {} edges, {} lines so far (this input)", edges.len(), lines.len());
+        }
+    }
+    if let Some((ci, children)) = current.take() {
+        process(ci, children, &mut funcs, &mut edges, &mut lines, &mut ar_rows, &mut ar_pending, &mut obj_of_call)?;
+    }
+    drop(calls_rows);
+    drop(ar_rows);
+    } // per-input streaming loop
+    drop(funcs);
+
+    Ok(InputResult { edges, lines, owner_writes, n_resolved, n_skipped, n_calls, ar_consumed, n_attr_reads })
 }
 
 /// Decode a tracer CFG blob: 9-byte records {u32 line, u8 kind, u32 target}.
