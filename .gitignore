@@ -6,3 +6,4 @@ traces
 *.egg-info
 venv
 build
+.cargo-cache
