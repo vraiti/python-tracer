@@ -50,7 +50,7 @@ pub fn run(db: &str, src: (i64, i64), dst: (i64, i64)) -> Result<(), String> {
     // Load edges, compacting (pid, call_id) keys to dense u32 ids.
     let mut ids: HashMap<u64, u32> = HashMap::new();
     let mut keys: Vec<u64> = Vec::new();
-    let mut intern = |k: u64, keys: &mut Vec<u64>, ids: &mut HashMap<u64, u32>| -> u32 {
+    let intern = |k: u64, keys: &mut Vec<u64>, ids: &mut HashMap<u64, u32>| -> u32 {
         *ids.entry(k).or_insert_with(|| {
             keys.push(k);
             (keys.len() - 1) as u32
