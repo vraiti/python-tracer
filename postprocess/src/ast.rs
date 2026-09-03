@@ -200,11 +200,11 @@ pub struct AstServer {
 
 impl AstServer {
     pub fn spawn(python: &str) -> std::io::Result<Self> {
+        // PYTHON_D3G_CONFIG/OUTDIR are already removed from this process's
+        // own environment in main() before any AstServer is spawned, so
+        // this child inherits a clean environment without tracing itself.
         let mut child = Command::new(python)
             .args(["-m", "d3g.astdump"])
-            // Never trace the helper, whatever the caller's environment.
-            .env_remove("PYTHON_TRACER_CONFIG")
-            .env_remove("PYTHON_TRACER_OUTDIR")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
