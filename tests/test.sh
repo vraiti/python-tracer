@@ -26,16 +26,15 @@ if [ "$status" -ne 143 ]; then
     exit 1
 fi
 
-# The runner leaves one {pid}.db per process under a numbered run
-# directory (outdir/1, outdir/2, ... -- a fresh OUTDIR always yields "1");
-# postprocess takes that run directory as a subdir of PYTHON_D3G_OUTDIR and
-# merges it into trace.db offline, then builds the dependency graph.
-# d3g.astdump is parsed by $VIRTUAL_ENV/bin/python3, a plain venv with no
-# d3g package installed; point it at cpython/Lib so it can find it.
+# The runner leaves one {pid}.db per process directly under OUTDIR;
+# postprocess merges them in place into OUTDIR/trace.db, then builds the
+# dependency graph. d3g.astdump is parsed by $VIRTUAL_ENV/bin/python3, a
+# plain venv with no d3g package installed; point it at cpython/Lib so it
+# can find it.
 VIRTUAL_ENV="$ROOT/venv" PYTHON_D3G_OUTDIR="$OUTDIR" PYTHONPATH="$ROOT/cpython/Lib" \
-    "$CPYTHON" -m d3g.postprocess 1
+    "$CPYTHON" -m d3g.postprocess
 
-DB_PATH="$OUTDIR/1/trace.db"
+DB_PATH="$OUTDIR/trace.db"
 if [ ! -f "$DB_PATH" ]; then
     echo "no trace.db produced" >&2
     exit 1
