@@ -1,0 +1,30 @@
+# Build/test environment for `make test` -- deliberately separate from
+# Containerfile (which targets the RHEL 10 deploy glibc): the test suite only
+# needs to build and run on this host's own architecture, so a plain Fedora
+# image is simpler (readline-devel/gdbm-devel and rust/cargo are all in
+# Fedora's public repos, unlike UBI10's) and, more importantly, isolated from
+# whatever cpython/ build state Containerfile's UBI10 image has cached (see
+# tests/test-container.sh's cpython/ overlay).
+FROM fedora:44
+
+RUN dnf install -y \
+        gcc gcc-c++ make git \
+        zlib-devel bzip2-devel xz-devel libffi-devel \
+        openssl-devel sqlite-devel \
+        tk-devel libuuid-devel expat-devel \
+        ncurses-devel readline-devel gdbm-devel \
+        python3.14 rust cargo \
+    && ln -sf python3.14 /usr/bin/python3 \
+    && ln -sf python3 /usr/bin/python \
+    && dnf clean all
+
+# Containers have no /etc/machine-id by default, so the tracer records an
+# empty one and the postprocessor's machine-id check (meant to catch
+# postprocessing a trace on a different machine than it was collected on)
+# rejects it. Both tracing and postprocessing happen inside this same
+# container here, so any fixed, non-empty id is fine -- it doesn't need to
+# match the real host's.
+RUN echo "d3g0000000000000000000000000000" > /etc/machine-id
+
+WORKDIR /src
+CMD ["bash", "-c", "make build && tests/test.sh"]

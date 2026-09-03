@@ -17,5 +17,5 @@ clean:
 	cargo clean --manifest-path postprocess/Cargo.toml
 	rm -rf build
 
-test: build
-	tests/test.sh
+test:
+	tests/test-container.sh
