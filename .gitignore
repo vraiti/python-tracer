@@ -7,3 +7,4 @@ traces
 venv
 build
 .cargo-cache
+.container-overlay
