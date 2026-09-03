@@ -16,6 +16,7 @@ RUN dnf install -y \
         openssl-devel sqlite-devel \
         tk-devel libuuid-devel expat-devel \
         ncurses-devel \
+	python3.14 \
     && dnf clean all
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
