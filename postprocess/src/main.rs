@@ -20,10 +20,30 @@ use resolve::{AttrRead, CallInfo, Edge, Kind, TargetType};
 use rusqlite::{params, Connection, Statement};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 type Key = (i64, i64);
+
+/// Per-thread progress counters, updated continuously (relaxed, lock-free)
+/// by a `process_input` worker and polled by the logger thread. 128-byte
+/// aligned so adjacent threads' slots never share a cache line -- without
+/// this, one thread's frequent stores would invalidate its neighbor's copy
+/// on every write (false sharing), even though the two never touch the same
+/// logical data.
+#[repr(align(128))]
+struct Progress {
+    n_calls: AtomicUsize,
+    n_edges: AtomicUsize,
+    n_lines: AtomicUsize,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Progress { n_calls: AtomicUsize::new(0), n_edges: AtomicUsize::new(0), n_lines: AtomicUsize::new(0) }
+    }
+}
 
 fn usage() -> ! {
     eprintln!("usage: d3g-postprocess TRACE_SUBDIR\n\n\
@@ -89,11 +109,7 @@ fn main() {
     std::env::remove_var("PYTHON_D3G_CONFIG");
     std::env::remove_var("PYTHON_D3G_OUTDIR");
 
-    // D3G_REPLAY=skeleton selects the statement-skeleton replay (the
-    // original algorithm) instead of the bytecode CFG walk; for comparison.
-    let skeleton_replay = std::env::var("D3G_REPLAY").map(|v| v == "skeleton").unwrap_or(false);
-
-    if let Err(e) = postprocess(&target, &python, skeleton_replay) {
+    if let Err(e) = postprocess(&target, &python) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
@@ -196,7 +212,8 @@ const COPY_SCHEMA: &str = "
     CREATE TABLE calls (
         pid INTEGER NOT NULL, call_id INTEGER NOT NULL, function_id INTEGER NOT NULL,
         caller_id INTEGER NOT NULL, call_lineno INTEGER NOT NULL, obj_id INTEGER NOT NULL,
-        control_flow BLOB, func_idx INTEGER NOT NULL DEFAULT 0,
+        control_flow BLOB, control_flow_bits INTEGER NOT NULL DEFAULT 0, control_flow_exc BLOB,
+        func_idx INTEGER NOT NULL DEFAULT 0,
         created_id INTEGER NOT NULL DEFAULT 0, created_lineno INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (pid, call_id));
     DROP TABLE IF EXISTS attr_reads;
@@ -226,7 +243,7 @@ const COPY_SCHEMA: &str = "
         pid INTEGER NOT NULL, io_object_id INTEGER NOT NULL, call_id INTEGER NOT NULL,
         offset INTEGER NOT NULL, length INTEGER NOT NULL, op_type INTEGER NOT NULL);";
 
-fn postprocess(target: &Path, python: &str, skeleton_replay: bool) -> Result<(), String> {
+fn postprocess(target: &Path, python: &str) -> Result<(), String> {
     let t0 = Instant::now();
     let is_dir = target.is_dir();
     let (out_path, input_paths) = if is_dir {
@@ -380,7 +397,7 @@ fn postprocess(target: &Path, python: &str, skeleton_replay: bool) -> Result<(),
             conn.execute_batch(&format!(
                 "INSERT INTO calls
                  SELECT c.pid, c.call_id, COALESCE(m.new, c.function_id), c.caller_id,
-                        c.call_lineno, c.obj_id, NULL, {extra}
+                        c.call_lineno, c.obj_id, NULL, 0, NULL, {extra}
                  FROM child.calls c LEFT JOIN fmap m ON m.old = c.function_id;
                  INSERT INTO meta SELECT * FROM child.meta;
                  INSERT OR IGNORE INTO machine SELECT * FROM child.machine;
@@ -452,7 +469,28 @@ fn postprocess(target: &Path, python: &str, skeleton_replay: bool) -> Result<(),
     // for a single input (including the non-directory case, where the lone
     // "input" is `conn` itself, already mid-transaction).
     let per_input: Vec<Result<InputResult, String>> = if input_paths.len() > 1 {
+        let progress: Vec<Progress> = (0..input_paths.len()).map(|_| Progress::new()).collect();
+        let stop = AtomicBool::new(false);
         thread::scope(|scope| {
+            // Logger: polls every worker's slot once a second and prints the
+            // aggregate. Approximate by design (Relaxed loads racing against
+            // in-flight Relaxed stores) -- fine, since this is a progress
+            // indicator, not something anything else depends on.
+            scope.spawn(|| {
+                let t0 = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_secs(1));
+                    let (calls, edges, lines) = progress.iter().fold((0, 0, 0), |(c, e, l), p| {
+                        (
+                            c + p.n_calls.load(Ordering::Relaxed),
+                            e + p.n_edges.load(Ordering::Relaxed),
+                            l + p.n_lines.load(Ordering::Relaxed),
+                        )
+                    });
+                    println!("  {calls} calls, {edges} edges, {lines} lines, {:.0}s", t0.elapsed().as_secs_f64());
+                }
+            });
+
             let handles: Vec<_> = (0..input_paths.len())
                 .map(|i| {
                     let path = &input_paths[i];
@@ -462,23 +500,25 @@ fn postprocess(target: &Path, python: &str, skeleton_replay: bool) -> Result<(),
                     let members = &members;
                     let objects = &objects;
                     let init_calls = &init_calls;
+                    let prog = &progress[i];
                     scope.spawn(move || {
                         let ic = Connection::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
                         ic.execute_batch("PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY;")
                             .map_err(|e| e.to_string())?;
                         process_input(
-                            &ic, fmap, func_map, cfg_map, members, objects, init_calls, python,
-                            skeleton_replay,
+                            &ic, fmap, func_map, cfg_map, members, objects, init_calls, python, prog,
                         )
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            let results = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            stop.store(true, Ordering::Relaxed);
+            results
         })
     } else {
+        let progress = Progress::new();
         vec![process_input(
-            input_conn(0), &fmaps[0], &func_map, &cfg_map, &members, &objects, &init_calls, python,
-            skeleton_replay,
+            input_conn(0), &fmaps[0], &func_map, &cfg_map, &members, &objects, &init_calls, python, &progress,
         )]
     };
 
@@ -738,7 +778,7 @@ fn process_input(
     objects: &IndexMap<Key, i64>,
     init_calls: &HashSet<Key>,
     python: &str,
-    skeleton_replay: bool,
+    progress: &Progress,
 ) -> Result<InputResult, String> {
     let n_attr_reads: i64 = ic
         .query_row("SELECT count(*) FROM attr_reads", [], |r| r.get::<_, i64>(0))
@@ -799,7 +839,8 @@ fn process_input(
     let mut calls_stmt = ic
         .prepare(
             if has_creation {
-                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, \
+                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, \
+                        p.control_flow_bits, p.control_flow_exc, c.call_id, \
                         CASE WHEN c.created_id <> 0 AND c.created_lineno <> 0 \
                              THEN c.created_lineno ELSE c.call_lineno END, \
                         c.function_id, c.func_idx \
@@ -807,11 +848,13 @@ fn process_input(
                    ON c.pid = p.pid AND c.resolve_parent = p.call_id \
                  ORDER BY p.rowid"
             } else if has_identity {
-                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, c.call_lineno, c.function_id, c.func_idx \
+                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, \
+                        p.control_flow_bits, p.control_flow_exc, c.call_id, c.call_lineno, c.function_id, c.func_idx \
                  FROM calls p LEFT JOIN calls c ON c.pid = p.pid AND c.caller_id = p.call_id \
                  ORDER BY p.rowid"
             } else {
-                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, c.call_id, c.call_lineno, c.function_id, 0 \
+                "SELECT p.pid, p.call_id, p.function_id, p.obj_id, p.control_flow, \
+                        p.control_flow_bits, p.control_flow_exc, c.call_id, c.call_lineno, c.function_id, 0 \
                  FROM calls p LEFT JOIN calls c ON c.pid = p.pid AND c.caller_id = p.call_id \
                  ORDER BY p.rowid"
             },
@@ -868,20 +911,19 @@ fn process_input(
             return Ok(());
         };
         let blob = ci.control_flow.as_deref().unwrap_or(&[]);
-        let executed = match cfg_map.get(&ci.function_id) {
-            Some(cfg) if !skeleton_replay => {
-                if blob.len() >= 100_000 {
-                    eprintln!("  large control-flow record: {} bytes, cfg {} nodes: {}", blob.len(), cfg.len(), ci.ref_);
-                }
-                let ex = resolve::replay_cfg(&func.b, cfg, blob);
-                let steps = resolve::REPLAY_STEPS.with(|c| c.get());
-                if steps >= 200_000 {
-                    eprintln!("  slow replay: {} steps, blob {} bytes, {} stmts, cfg {} nodes: {}", steps, blob.len(), ex.len(), cfg.len(), ci.ref_);
-                }
-                ex
-            }
-            _ => resolve::reconstruct(&func.b, blob),
+        let exc = ci.control_flow_exc.as_deref().unwrap_or(&[]);
+        let Some(cfg) = cfg_map.get(&ci.function_id) else {
+            n_skipped += 1;
+            return Ok(());
         };
+        if blob.len() >= 100_000 {
+            eprintln!("  large control-flow record: {} bytes, cfg {} nodes: {}", blob.len(), cfg.len(), ci.ref_);
+        }
+        let executed = resolve::replay_cfg(&func.b, cfg, blob, ci.control_flow_bits, exc);
+        let steps = resolve::REPLAY_STEPS.with(|c| c.get());
+        if steps >= 200_000 {
+            eprintln!("  slow replay: {} steps, blob {} bytes, {} stmts, cfg {} nodes: {}", steps, blob.len(), executed.len(), cfg.len(), ci.ref_);
+        }
         for (order, stmt) in executed.iter().enumerate() {
             lines_out.push((ci.pid, ci.call_id, order as i64, stmt.l));
         }
@@ -944,6 +986,7 @@ fn process_input(
             let raw_fid: i64 = r.get(2).map_err(|e| e.to_string())?;
             let function_id = fmap.get(&raw_fid).copied().unwrap_or(raw_fid);
             let cf: Option<Vec<u8>> = r.get(4).map_err(|e| e.to_string())?;
+            let cf_exc: Option<Vec<u8>> = r.get(6).map_err(|e| e.to_string())?;
             current = Some((
                 CallInfo {
                     pid,
@@ -952,30 +995,36 @@ fn process_input(
                     call_lineno: 0,
                     obj_id: r.get(3).map_err(|e| e.to_string())?,
                     control_flow: cf.filter(|b| !b.is_empty()),
+                    control_flow_bits: r.get(5).map_err(|e| e.to_string())?,
+                    control_flow_exc: cf_exc.filter(|b| !b.is_empty()),
                     ref_: func_map.get(&function_id).cloned().unwrap_or_default(),
                     func_idx: 0,
                 },
                 Vec::new(),
             ));
         }
-        let child_id: Option<i64> = r.get(5).map_err(|e| e.to_string())?;
+        let child_id: Option<i64> = r.get(7).map_err(|e| e.to_string())?;
         if let Some(child_id) = child_id {
             let (_, children) = current.as_mut().unwrap();
-            let raw_fid: i64 = r.get(7).map_err(|e| e.to_string())?;
+            let raw_fid: i64 = r.get(9).map_err(|e| e.to_string())?;
             let fid = fmap.get(&raw_fid).copied().unwrap_or(raw_fid);
             children.push(CallInfo {
                 pid,
                 call_id: child_id,
                 function_id: fid,
-                call_lineno: r.get(6).map_err(|e| e.to_string())?,
+                call_lineno: r.get(8).map_err(|e| e.to_string())?,
                 obj_id: 0,
                 control_flow: None,
+                control_flow_bits: 0,
+                control_flow_exc: None,
                 ref_: func_map.get(&fid).cloned().unwrap_or_default(),
-                func_idx: r.get(8).map_err(|e| e.to_string())?,
+                func_idx: r.get(10).map_err(|e| e.to_string())?,
             });
         }
-        if n_calls % 1_000_000 == 0 && n_calls > 0 && !same {
-            eprintln!("  {n_calls} calls, {} edges, {} lines so far (this input)", edges.len(), lines.len());
+        if !same {
+            progress.n_calls.store(n_calls, Ordering::Relaxed);
+            progress.n_edges.store(edges.len(), Ordering::Relaxed);
+            progress.n_lines.store(lines.len(), Ordering::Relaxed);
         }
     }
     if let Some((ci, children)) = current.take() {

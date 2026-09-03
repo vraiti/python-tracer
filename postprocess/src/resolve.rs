@@ -67,9 +67,53 @@ pub struct CallInfo {
     pub call_lineno: i64,
     pub obj_id: i64,
     pub control_flow: Option<Vec<u8>>,
+    /// Exact valid bit count within `control_flow` (its byte length is
+    /// rounded up, so this is needed to avoid misreading padding bits).
+    pub control_flow_bits: i64,
+    pub control_flow_exc: Option<Vec<u8>>,
     pub ref_: String,
     /// Trace id of the function object this call executed (0 if untracked).
     pub func_idx: i64,
+}
+
+/// One decoded exception record: absolute bit position in the frame's own
+/// `control_flow` bit-stream at which it preempts the next decision, the
+/// handler's bytecode offset from its function's start, and how many nested
+/// traced calls below this frame were abandoned by the exception.
+struct ExcRecord {
+    bit_pos: u64,
+    handler_off: i64,
+    unwind_depth: u64,
+}
+
+fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        result |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+    }
+}
+
+fn decode_exc(exc: &[u8]) -> Vec<ExcRecord> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut bit_pos = 0u64;
+    while pos < exc.len() {
+        let (Some(delta), Some(handler_off), Some(unwind_depth)) =
+            (read_varint(exc, &mut pos), read_varint(exc, &mut pos), read_varint(exc, &mut pos))
+        else {
+            break;
+        };
+        bit_pos += delta;
+        out.push(ExcRecord { bit_pos, handler_off: handler_off as i64, unwind_depth });
+    }
+    out
 }
 
 pub struct AttrRead {
@@ -83,11 +127,22 @@ pub struct AttrRead {
 /// emitted. Consecutive re-entries of the same statement (a multi-line
 /// statement whose bytecode revisits its first line) collapse to one.
 ///
-/// Node kinds follow astdump.py: 0 linear, 1 conditional jump (byte 1 =
-/// taken), 2 FOR_ITER (byte 1 = exhausted), 3 unconditional jump, 4 SEND
-/// (await: continue at END_SEND), 5 GET_ANEXT (byte 0 per attempt; a
-/// following 2 means the loop is exhausted), 6 return/raise.
-pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> Vec<&'a Stmt> {
+/// Node kinds follow astdump.py: 0 linear, 1 conditional jump (bit 1 =
+/// taken), 2 FOR_ITER (bit 1 = exhausted), 3 unconditional jump, 4 SEND
+/// (await: continue at END_SEND), 5 GET_ANEXT (bit 0 per attempt; a
+/// following 1 means the loop is exhausted), 6 return/raise.
+///
+/// `bits`/`total_bits` are the packed branch-decision stream (`total_bits`
+/// is the exact valid count -- `bits`' byte length is rounded up, so this
+/// bounds reads against padding). `exc` is the separate varint-tuple
+/// exception stream, never interleaved with `bits`.
+pub fn replay_cfg<'a>(
+    body: &'a [Stmt],
+    cfg: &[(i64, u8, i64)],
+    bits: &[u8],
+    total_bits: i64,
+    exc: &[u8],
+) -> Vec<&'a Stmt> {
     fn index<'a>(stmts: &'a [Stmt], by_line: &mut HashMap<i64, Vec<&'a Stmt>>) {
         for s in stmts {
             by_line.entry(s.l).or_default().push(s);
@@ -108,26 +163,27 @@ pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> 
     let mut by_line: HashMap<i64, Vec<&'a Stmt>> = HashMap::new();
     index(body, &mut by_line);
 
-    // Handler entry nodes (kind 7) keyed by the code-unit offset the tracer
-    // records (3 + u32) when an exception transfers control there.
+    // Handler entry nodes (kind 7) keyed by the code-unit offset carried in
+    // each decoded exception record.
     let handlers: HashMap<i64, usize> =
         cfg.iter().enumerate().filter(|(_, n)| n.1 == 7).map(|(i, n)| (n.2, i)).collect();
-    let handler_jump = |pos: &mut usize| -> Option<usize> {
-        if blob.get(*pos) != Some(&3) || *pos + 5 > blob.len() {
+    let excs = decode_exc(exc);
+    let total_bits = total_bits.max(0) as u64;
+    let get_bit = |bitpos: u64| -> Option<u8> {
+        if bitpos >= total_bits {
             return None;
         }
-        let b = &blob[*pos + 1..*pos + 5];
-        let off = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64;
-        *pos += 5;
-        handlers.get(&off).copied()
+        Some((bits[(bitpos / 8) as usize] >> (bitpos % 8)) & 1)
     };
+
     let mut out: Vec<&'a Stmt> = Vec::new();
-    let mut pos = 0usize;
+    let mut bitpos = 0u64;
+    let mut exc_idx = 0usize;
     let mut idx = 0usize;
     let mut last_line = -1i64;
-    // Back edges taken without consuming any byte since the previous pass
+    // Back edges taken without consuming any bit since the previous pass
     // (e.g. `while True:` whose exit is an exception) terminate the walk.
-    let mut back_edge_pos: HashMap<usize, usize> = HashMap::new();
+    let mut back_edge_pos: HashMap<usize, u64> = HashMap::new();
     let mut steps = 0usize;
     while idx < cfg.len() && steps < 4_000_000 {
         steps += 1;
@@ -143,11 +199,16 @@ pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> 
             last_line = line;
         }
         let jump = |taken: bool, idx: usize| if taken { target as usize } else { idx + 1 };
-        // An exception raised since the last consumed byte shows up as a
-        // handler entry wherever the walk next needs a byte.
-        if blob.get(pos) == Some(&3) && matches!(kind, 1 | 2 | 5 | 6) {
-            match handler_jump(&mut pos) {
-                Some(h) => {
+        // An exception raised since the last consumed bit shows up as a
+        // handler entry wherever the walk next needs a bit.
+        if matches!(kind, 1 | 2 | 5 | 6)
+            && exc_idx < excs.len()
+            && excs[exc_idx].bit_pos == bitpos
+        {
+            let rec = &excs[exc_idx];
+            exc_idx += 1;
+            match handlers.get(&rec.handler_off) {
+                Some(&h) => {
                     idx = h;
                     continue;
                 }
@@ -155,31 +216,31 @@ pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> 
             }
         }
         idx = match kind {
-            1 | 2 => match blob.get(pos) {
-                Some(&b) if b <= 1 => {
-                    pos += 1;
+            1 | 2 => match get_bit(bitpos) {
+                Some(b) => {
+                    bitpos += 1;
                     jump(b == 1, idx)
                 }
-                _ => break,
+                None => break,
             },
             3 => {
                 let t = target as usize;
                 if t <= idx {
-                    if back_edge_pos.get(&idx) == Some(&pos) {
+                    if back_edge_pos.get(&idx) == Some(&bitpos) {
                         break;
                     }
-                    back_edge_pos.insert(idx, pos);
+                    back_edge_pos.insert(idx, bitpos);
                 }
                 t
             }
             4 => target as usize,
             5 => {
-                if blob.get(pos) != Some(&0) {
+                if get_bit(bitpos) != Some(0) {
                     break;
                 }
-                pos += 1;
-                if blob.get(pos) == Some(&2) {
-                    pos += 1;
+                bitpos += 1;
+                if get_bit(bitpos) == Some(1) {
+                    bitpos += 1;
                     target as usize
                 } else {
                     idx + 1
@@ -196,53 +257,6 @@ pub fn replay_cfg<'a>(body: &'a [Stmt], cfg: &[(i64, u8, i64)], blob: &[u8]) -> 
 thread_local! {
     /// Steps taken by the most recent `replay_cfg` (diagnostics).
     pub static REPLAY_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// `reconstruct_executed_stmts`: replay the branch bytes over the body.
-/// 0 = jump not taken (if-body runs / loop yields), 1 = taken.
-pub fn reconstruct<'a>(body: &'a [Stmt], blob: &[u8]) -> Vec<&'a Stmt> {
-    struct Walker<'a, 'b> {
-        blob: &'b [u8],
-        pos: usize,
-        out: Vec<&'a Stmt>,
-    }
-    impl<'a, 'b> Walker<'a, 'b> {
-        fn consume(&mut self) -> Option<u8> {
-            let v = self.blob.get(self.pos).copied();
-            if v.is_some() {
-                self.pos += 1;
-            }
-            v
-        }
-        fn walk(&mut self, stmts: &'a [Stmt]) {
-            for stmt in stmts {
-                self.out.push(stmt);
-                match &stmt.kind {
-                    StmtKind::For { b, e, .. } | StmtKind::While { b, e, .. } => {
-                        while self.consume() == Some(0) {
-                            self.walk(b);
-                        }
-                        if !e.is_empty() {
-                            self.walk(e);
-                        }
-                    }
-                    StmtKind::If { b, e, .. } => {
-                        let decision = self.consume();
-                        if decision == Some(0) {
-                            self.walk(b);
-                        } else if !e.is_empty() {
-                            self.walk(e);
-                        }
-                    }
-                    StmtKind::With { b } | StmtKind::Try { b, .. } => self.walk(b),
-                    _ => {}
-                }
-            }
-        }
-    }
-    let mut w = Walker { blob, pos: 0, out: Vec::new() };
-    w.walk(body);
-    w.out
 }
 
 struct ValueSource {
