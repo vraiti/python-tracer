@@ -11,6 +11,7 @@
 //! resident.
 
 mod ast;
+mod counts;
 mod reach;
 mod resolve;
 
@@ -54,7 +55,10 @@ fn usage() -> ! {
                ($VIRTUAL_ENV must be set).\n\n\
                d3g-postprocess reach TRACE_DB SRC_PID:SRC_CALL DST_PID:DST_CALL\n\
                Reports whether a dataflow path connects the two calls, with a\n\
-               shortest witness path.");
+               shortest witness path.\n\n\
+               d3g-postprocess counts TRACE_DB\n\
+               Prints each traced function's invocation count (tab-separated\n\
+               count and ref), most-called first.");
     std::process::exit(2);
 }
 
@@ -73,6 +77,16 @@ fn main() {
             usage()
         };
         if let Err(e) = reach::run(db, src, dst) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("counts") {
+        let a: Vec<String> = std::env::args().skip(2).collect();
+        let Some(db) = a.first() else { usage() };
+        if let Err(e) = counts::run(db) {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
