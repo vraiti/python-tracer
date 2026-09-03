@@ -1,10 +1,11 @@
-.PHONY: build clean
+.PHONY: build clean test
 
 cpython/Makefile:
 	cd cpython && ./configure --prefix=$(CURDIR)/build
 
 build: cpython/Makefile
 	mkdir -p build
+	$(MAKE) -C cpython -j$(shell nproc) regen-generated-cases regen-executor-cases
 	$(MAKE) -C cpython -j$(shell nproc)
 	$(MAKE) -C cpython altinstall
 	cargo build --release --manifest-path postprocess/Cargo.toml
@@ -15,3 +16,6 @@ clean:
 	test ! -f cpython/Makefile || $(MAKE) -C cpython distclean
 	cargo clean --manifest-path postprocess/Cargo.toml
 	rm -rf build
+
+test: build
+	tests/test.sh

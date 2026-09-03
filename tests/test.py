@@ -1,61 +1,23 @@
-"""End-to-end check of the d3g tracer and postprocessor.
+"""Structural checks for a trace.db produced by tests/test.sh.
 
-Runs tests/testapp under the instrumented interpreter, postprocesses the
-merged trace, and asserts structural properties of the result: the
-expected calls, objects and memberships are present, and data dependencies
-are recorded across call, thread and process boundaries. No baseline
-database is used; every expectation is derived from the test application's
-source so that the checks survive unrelated changes in ids and ordering.
+Asserts structural properties of a postprocessed d3g trace: the expected
+calls, objects and memberships are present, and data dependencies are
+recorded across call, thread and process boundaries. No baseline database
+is used; every expectation is derived from the test application's source
+so that the checks survive unrelated changes in ids and ordering.
+
+tests/test.sh runs the traced app and the postprocessor, then invokes this
+script with the resulting trace.db as its only argument.
 """
 
 import os
-import signal
 import sqlite3
-import subprocess
 import sys
-import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CPYTHON = os.path.join(ROOT, "cpython", "python")
-TESTS = os.path.join(ROOT, "tests")
-CONFIG = os.path.join(TESTS, "testapp-config.json")
-SCRIPT = os.path.join(TESTS, "testapp", "main.py")
+TESTS = os.path.dirname(os.path.abspath(__file__))
 CORE = os.path.join(TESTS, "testapp", "core.py")
 
 IO_OP_READ, IO_OP_WRITE = 0, 1
-
-
-# ---------------------------------------------------------------------------
-# Running
-# ---------------------------------------------------------------------------
-
-def run_trace(output_dir):
-    env = os.environ.copy()
-    env["PYTHONPATH"] = TESTS
-    env["PYTHON_TRACER_CONFIG"] = CONFIG
-    env["PYTHON_TRACER_OUTDIR"] = output_dir
-    result = subprocess.run(
-        [CPYTHON, "-m", "d3g", "--", SCRIPT],
-        cwd=ROOT, env=env, capture_output=True, text=True,
-    )
-    # The application ends itself with SIGTERM under SIG_DFL; the tracer must
-    # preserve the default action (death by signal) after flushing.
-    if result.returncode != -signal.SIGTERM:
-        print(result.stderr, file=sys.stderr)
-        raise RuntimeError(f"tracer exited with {result.returncode}, expected -SIGTERM")
-    # The runner leaves one {pid}.db per process; postprocess merges the
-    # directory into trace.db offline and then builds the dependency graph.
-    result = subprocess.run(
-        [CPYTHON, "-m", "d3g.postprocess", output_dir],
-        cwd=ROOT, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(result.stderr, file=sys.stderr)
-        raise RuntimeError(f"postprocess exited with {result.returncode}")
-    db_path = os.path.join(output_dir, "trace.db")
-    if not os.path.exists(db_path):
-        raise RuntimeError("no trace.db produced")
-    return db_path
 
 
 # ---------------------------------------------------------------------------
@@ -378,10 +340,8 @@ def check_trace(db_path):
     return failures
 
 
-def test_trace():
-    with tempfile.TemporaryDirectory() as d:
-        db_path = run_trace(d)
-        failures = check_trace(db_path)
+def test_trace(db_path):
+    failures = check_trace(db_path)
     if failures:
         for f in failures:
             print(f"FAIL: {f}", file=sys.stderr)
@@ -390,4 +350,7 @@ def test_trace():
 
 
 if __name__ == "__main__":
-    test_trace()
+    if len(sys.argv) != 2:
+        print("usage: test.py TRACE_DB", file=sys.stderr)
+        sys.exit(2)
+    test_trace(sys.argv[1])
