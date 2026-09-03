@@ -46,10 +46,10 @@ impl Progress {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: d3g-postprocess TRACE_SUBDIR\n\n\
-               TRACE_SUBDIR is a subdirectory of $PYTHON_D3G_OUTDIR (its per-process\n\
-               {{pid}}.db files are read in place; the dependency graph and\n\
-               blob-free copies of the input tables are written to trace.db).\n\
+    eprintln!("usage: d3g-postprocess\n\n\
+               Processes $PYTHON_D3G_OUTDIR in place (its per-process {{pid}}.db\n\
+               files are read in place; the dependency graph and blob-free copies\n\
+               of the input tables are written to $PYTHON_D3G_OUTDIR/trace.db).\n\
                The interpreter used to parse source files is $VIRTUAL_ENV/bin/python3\n\
                ($VIRTUAL_ENV must be set).\n\n\
                d3g-postprocess reach TRACE_DB SRC_PID:SRC_CALL DST_PID:DST_CALL\n\
@@ -79,15 +79,12 @@ fn main() {
         return;
     }
 
-    let mut subdir: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => usage(),
-            _ if subdir.is_none() => subdir = Some(a),
             _ => usage(),
         }
     }
-    let Some(subdir) = subdir else { usage() };
 
     let venv = std::env::var("VIRTUAL_ENV").unwrap_or_else(|_| {
         eprintln!("Error: VIRTUAL_ENV not set");
@@ -99,7 +96,7 @@ fn main() {
         eprintln!("Error: PYTHON_D3G_OUTDIR not set");
         std::process::exit(1);
     });
-    let target = PathBuf::from(outdir).join(subdir);
+    let target = PathBuf::from(outdir);
 
     // Read, then mask: the python subprocess spawned below (ast.rs's
     // AstServer) inherits this process's environment, and a d3g-instrumented
