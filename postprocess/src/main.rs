@@ -14,6 +14,7 @@ mod ast;
 mod counts;
 mod reach;
 mod resolve;
+mod sequence;
 
 use ast::{AstServer, Def};
 use indexmap::IndexMap;
@@ -58,7 +59,9 @@ fn usage() -> ! {
                shortest witness path.\n\n\
                d3g-postprocess counts TRACE_DB\n\
                Prints each traced function's invocation count (tab-separated\n\
-               count and ref), most-called first.");
+               count and ref), most-called first.\n\n\
+               d3g-postprocess sequence TRACE_DB\n\
+               Prints every traced call in the order it occurred, grouped by pid.");
     std::process::exit(2);
 }
 
@@ -87,6 +90,16 @@ fn main() {
         let a: Vec<String> = std::env::args().skip(2).collect();
         let Some(db) = a.first() else { usage() };
         if let Err(e) = counts::run(db) {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if std::env::args().nth(1).as_deref() == Some("sequence") {
+        let a: Vec<String> = std::env::args().skip(2).collect();
+        let Some(db) = a.first() else { usage() };
+        if let Err(e) = sequence::run(db) {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
